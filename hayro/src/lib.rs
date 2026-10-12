@@ -47,7 +47,7 @@ use hayro_interpret::{ClipPath, interpret_page};
 use kurbo::{Affine, BezPath, Rect, Shape};
 use pic_scale::Scaler;
 use rustc_hash::FxHashMap;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::ops::RangeInclusive;
 use std::rc::Rc;
 
@@ -56,6 +56,7 @@ pub use hayro_interpret::hayro_syntax;
 pub use kurbo;
 pub use vello_cpu;
 
+use hayro_interpret::encode::SampledShadingCache;
 use vello_cpu::color::palette::css::{TRANSPARENT, WHITE};
 use vello_cpu::color::{AlphaColor, Srgb};
 use vello_cpu::peniko::{Compose, Fill, Mix};
@@ -71,6 +72,10 @@ mod path;
 pub(crate) struct GlobalState {
     level: Level,
     outline_cache: Rc<RefCell<FxHashMap<u128, Rc<BezPath>>>>,
+    soft_mask_cache: Rc<RefCell<mask::SoftMaskCache>>,
+    shading_cache: Rc<RefCell<SampledShadingCache>>,
+    /// A pixmap that can be reused for rendering soft masks.
+    mask_pixmap: Cell<Option<Pixmap>>,
     scaler: Scaler,
     force_image_interpolation: bool,
 }
@@ -80,6 +85,9 @@ impl GlobalState {
         Self {
             level: Level::new(),
             outline_cache: cache.outline_cache.clone(),
+            soft_mask_cache: cache.soft_mask_cache.clone(),
+            shading_cache: cache.shading_cache.clone(),
+            mask_pixmap: Cell::new(None),
             scaler: Scaler::new(image::RESAMPLING_FUNCTION),
             force_image_interpolation: settings.force_image_interpolation,
         }
@@ -91,6 +99,11 @@ pub(crate) struct Renderer<'a> {
     pub(crate) ctx: &'a mut RenderContext,
     pub(crate) inside_pattern: bool,
     pub(crate) soft_mask_cache: FxHashMap<u128, Mask>,
+    /// Whether soft masks may be shared with other pages through the [`RenderCache`].
+    ///
+    /// This is only enabled for the renderer of the page itself: masks drawn while rendering
+    /// a soft mask or pattern can render differently because of nesting limits.
+    pub(crate) share_soft_masks: bool,
     pub(crate) in_type3_glyph: bool,
 }
 
@@ -101,6 +114,7 @@ impl<'r> Renderer<'r> {
             ctx,
             inside_pattern: false,
             soft_mask_cache: FxHashMap::default(),
+            share_soft_masks: false,
             in_type3_glyph: false,
         }
     }
@@ -180,6 +194,8 @@ impl<'a, 'r> Device<'a> for Renderer<'r> {
 pub struct RenderCache<'a> {
     pub(crate) interpreter_cache: InterpreterCache<'a>,
     pub(crate) outline_cache: Rc<RefCell<FxHashMap<u128, Rc<BezPath>>>>,
+    pub(crate) soft_mask_cache: Rc<RefCell<mask::SoftMaskCache>>,
+    pub(crate) shading_cache: Rc<RefCell<SampledShadingCache>>,
 }
 
 impl<'a> RenderCache<'a> {
@@ -188,6 +204,8 @@ impl<'a> RenderCache<'a> {
         Self {
             interpreter_cache: InterpreterCache::new(),
             outline_cache: Rc::new(RefCell::new(FxHashMap::default())),
+            soft_mask_cache: Rc::new(RefCell::new(mask::SoftMaskCache::default())),
+            shading_cache: Rc::new(RefCell::new(SampledShadingCache::default())),
         }
     }
 }
@@ -291,6 +309,7 @@ pub fn render_into<'a>(
 
     let global = GlobalState::new(cache, render_settings);
     let mut device = Renderer::new(ctx, &global);
+    device.share_soft_masks = true;
     let mut clip_path = page.intersected_crop_box().to_kurbo().to_path(0.1);
     clip_path.apply_affine(transform);
     device.push_clip_path(&ClipPath {

@@ -162,6 +162,15 @@ impl<'a> SoftMask<'a> {
         self.0.background.clone()
     }
 
+    /// Return whether the mask's content is independent of the resources of the page it is
+    /// used on.
+    ///
+    /// If this is true, a mask with the same [cache key](CacheKey::cache_key) renders the same
+    /// way on every page of a document, so it can be reused across pages.
+    pub fn has_own_resources(&self) -> bool {
+        self.0.group.has_resources()
+    }
+
     /// Return the transfer function that should be used for the mask.
     pub fn transfer_function(&self) -> Option<&TransferFunction> {
         self.0.transfer_function.as_ref()

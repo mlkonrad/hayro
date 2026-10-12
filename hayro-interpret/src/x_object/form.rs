@@ -20,6 +20,11 @@ pub(crate) struct FormXObject<'a> {
 }
 
 impl<'a> FormXObject<'a> {
+    /// Whether the form `XObject` has its own resource dictionary.
+    pub(crate) fn has_resources(&self) -> bool {
+        self.resources.is_some()
+    }
+
     pub(crate) fn new(stream: &Stream<'a>) -> Option<Self> {
         let dict = stream.dict();
 

@@ -6,6 +6,7 @@ use crate::CacheKey;
 use crate::cache::Cache;
 use crate::color::{ColorComponents, ColorSpace};
 use crate::function::{Function, StitchingBounds, Values, interpolate};
+use crate::util::hash128;
 use crate::util::{Float32Ext, PointExt, RectExt};
 use hayro_syntax::bit_reader::BitReader;
 use hayro_syntax::object::Array;
@@ -139,7 +140,12 @@ pub struct Shading {
 
 impl Shading {
     pub(crate) fn new(dict: &Dict<'_>, stream: Option<&Stream<'_>>, cache: &Cache) -> Option<Self> {
-        let cache_key = dict.cache_key();
+        // Mesh shadings store their data in the stream, so streams with identical dictionaries
+        // can still describe different shadings.
+        let cache_key = match stream {
+            Some(stream) => hash128(&(dict.cache_key(), stream.raw_data().as_ref())),
+            None => dict.cache_key(),
+        };
 
         let shading_num = dict.get::<u8>(SHADING_TYPE)?;
 
@@ -450,7 +456,13 @@ impl CoonsPatch {
 
     /// Approximate the patch by triangles.
     pub fn to_triangles(&self, buffer: &mut Vec<Triangle>) {
-        generate_patch_triangles(|p| self.map_coordinate(p), |p| self.interpolate(p), buffer);
+        let grid = patch_grid(|i, j| self.map_coordinate(patch_grid_point(i, j)));
+        generate_patch_triangles(&grid, |p| self.interpolate(p), buffer);
+    }
+
+    /// The points of the grid that [`CoonsPatch::to_triangles`] uses.
+    pub(crate) fn grid(&self) -> PatchGrid {
+        patch_grid(|i, j| self.map_coordinate(patch_grid_point(i, j)))
     }
 
     /// Get the interpolated colors of the point from the patch.
@@ -479,6 +491,10 @@ impl CoonsPatch {
 }
 
 impl TensorProductPatch {
+    /// The index of the control point in row `i` and column `j` of the 4x4 grid.
+    const CONTROL_POINT_IDX: [[usize; 4]; 4] =
+        [[0, 1, 2, 3], [11, 12, 13, 4], [10, 15, 14, 5], [9, 8, 7, 6]];
+
     /// Evaluate Bernstein polynomial `B_i(t)` for tensor-product patches.
     fn bernstein(i: usize, t: f64) -> f64 {
         match i {
@@ -493,36 +509,21 @@ impl TensorProductPatch {
     /// Map the point to the coordinates of the tensor product patch.
     pub fn map_coordinate(&self, p: Point) -> Point {
         let (u, v) = (p.x, p.y);
+        let basis_u: [f64; 4] = std::array::from_fn(|i| Self::bernstein(i, u));
+        let basis_v: [f64; 4] = std::array::from_fn(|j| Self::bernstein(j, v));
 
+        self.map_coordinate_with_basis(&basis_u, &basis_v)
+    }
+
+    /// Map a point given by its Bernstein basis values in the `u` and `v` direction.
+    fn map_coordinate_with_basis(&self, basis_u: &[f64; 4], basis_v: &[f64; 4]) -> Point {
         let mut x = 0.0;
         let mut y = 0.0;
 
-        fn idx(i: usize, j: usize) -> usize {
-            match (i, j) {
-                (0, 0) => 0,
-                (0, 1) => 1,
-                (0, 2) => 2,
-                (0, 3) => 3,
-                (1, 0) => 11,
-                (1, 1) => 12,
-                (1, 2) => 13,
-                (1, 3) => 4,
-                (2, 0) => 10,
-                (2, 1) => 15,
-                (2, 2) => 14,
-                (2, 3) => 5,
-                (3, 0) => 9,
-                (3, 1) => 8,
-                (3, 2) => 7,
-                (3, 3) => 6,
-                _ => panic!("Invalid index"),
-            }
-        }
-
         for i in 0..4 {
             for j in 0..4 {
-                let control_point_idx = idx(i, j);
-                let basis = Self::bernstein(i, u) * Self::bernstein(j, v);
+                let control_point_idx = Self::CONTROL_POINT_IDX[i][j];
+                let basis = basis_u[i] * basis_v[j];
 
                 x += self.control_points[control_point_idx].x * basis;
                 y += self.control_points[control_point_idx].y * basis;
@@ -534,7 +535,40 @@ impl TensorProductPatch {
 
     /// Approximate the tensor product patch mesh by triangles.
     pub fn to_triangles(&self, buffer: &mut Vec<Triangle>) {
-        generate_patch_triangles(|p| self.map_coordinate(p), |p| self.interpolate(p), buffer);
+        generate_patch_triangles(&self.grid(), |p| self.interpolate(p), buffer);
+    }
+
+    /// The points of the grid that [`TensorProductPatch::to_triangles`] uses.
+    ///
+    /// This computes exactly the same values as calling `map_coordinate` for each grid
+    /// point, but evaluates the Bernstein polynomials only once per grid row and column.
+    pub(crate) fn grid(&self) -> PatchGrid {
+        let basis: [[f64; 4]; PATCH_GRID_SIZE] = std::array::from_fn(|i| {
+            let t = patch_grid_coordinate(i);
+            std::array::from_fn(|k| Self::bernstein(k, t))
+        });
+        // The control points in row-major order, so that x and y can be computed together.
+        let control_points: [[f64; 2]; 16] = std::array::from_fn(|k| {
+            let p = self.control_points[Self::CONTROL_POINT_IDX[k / 4][k % 4]];
+            [p.x, p.y]
+        });
+
+        patch_grid(|i, j| {
+            let (basis_u, basis_v) = (&basis[i], &basis[j]);
+            let mut acc = [0.0_f64; 2];
+
+            // The same operations as in `map_coordinate_with_basis`.
+            for i in 0..4 {
+                for j in 0..4 {
+                    let basis = basis_u[i] * basis_v[j];
+                    let p = control_points[i * 4 + j];
+                    acc[0] += p[0] * basis;
+                    acc[1] += p[1] * basis;
+                }
+            }
+
+            Point::new(acc[0], acc[1])
+        })
     }
 
     /// Get the interpolated colors of the point from the patch.
@@ -710,88 +744,79 @@ fn split_decode(decode: &[f32]) -> Option<([f32; 4], &[f32])> {
     decode.split_first_chunk::<4>().map(|(a, b)| (*a, b))
 }
 
-/// Generate triangles from a grid of points using a mapping function.
-fn generate_patch_triangles<F, I>(map_coordinate: F, interpolate: I, buffer: &mut Vec<Triangle>)
+/// The number of grid points per side when converting a patch into triangles.
+pub(crate) const PATCH_GRID_SIZE: usize = 20;
+
+/// The points of a patch, evaluated on a regular grid, indexed by `i * PATCH_GRID_SIZE + j`.
+pub(crate) type PatchGrid = [Point; PATCH_GRID_SIZE * PATCH_GRID_SIZE];
+
+/// The unit square coordinate of the `i`-th grid line, from 0.0 to 1.0.
+#[inline]
+pub(crate) fn patch_grid_coordinate(i: usize) -> f64 {
+    i as f64 / (PATCH_GRID_SIZE - 1) as f64
+}
+
+/// The unit square point of the grid point `(i, j)`.
+#[inline]
+pub(crate) fn patch_grid_point(i: usize, j: usize) -> Point {
+    // `u` goes from left to right and `v` from top to bottom.
+    Point::new(patch_grid_coordinate(i), patch_grid_coordinate(j))
+}
+
+fn patch_grid(map: impl Fn(usize, usize) -> Point) -> PatchGrid {
+    std::array::from_fn(|idx| map(idx / PATCH_GRID_SIZE, idx % PATCH_GRID_SIZE))
+}
+
+/// The two triangles each grid cell `(i, j)` is split into, as indices of grid points.
+#[inline]
+pub(crate) fn patch_cell_triangles(i: usize, j: usize) -> [[usize; 3]; 2] {
+    let idx = |i: usize, j: usize| i * PATCH_GRID_SIZE + j;
+    let (v00, v10, v01, v11) = (idx(i, j), idx(i + 1, j), idx(i, j + 1), idx(i + 1, j + 1));
+
+    [[v00, v10, v01], [v10, v11, v01]]
+}
+
+/// The factor by which triangles generated from patches are inflated.
+const PATCH_INFLATION_FACTOR: f64 = 1.025;
+
+/// Converting patches to triangles is lossy and can lead to gaps. To make this a bit better,
+/// we slightly inflate the triangles around their centroid.
+#[inline]
+pub(crate) fn inflate_triangle(points: [Point; 3]) -> [Point; 3] {
+    let mid = kurbo::Triangle::new(points[0], points[1], points[2]).centroid();
+    points.map(|p| mid + (p - mid) * PATCH_INFLATION_FACTOR)
+}
+
+/// Generate triangles from a grid of points.
+fn generate_patch_triangles<I>(grid: &PatchGrid, interpolate: I, buffer: &mut Vec<Triangle>)
 where
-    F: Fn(Point) -> Point,
     I: Fn(Point) -> ColorComponents,
 {
-    const GRID_SIZE: usize = 20;
-    let mut grid = vec![vec![Point::ZERO; GRID_SIZE]; GRID_SIZE];
+    // Each grid point is shared by up to four cells, so compute its color only once.
+    let vertices: Vec<TriangleVertex> = (0..grid.len())
+        .map(|idx| TriangleVertex {
+            flag: 0,
+            point: grid[idx],
+            colors: interpolate(patch_grid_point(
+                idx / PATCH_GRID_SIZE,
+                idx % PATCH_GRID_SIZE,
+            )),
+        })
+        .collect();
 
-    // Create grid by mapping unit square coordinates.
-    for i in 0..GRID_SIZE {
-        for j in 0..GRID_SIZE {
-            let u = i as f64 / (GRID_SIZE - 1) as f64; // 0.0 to 1.0 (left to right).
-            let v = j as f64 / (GRID_SIZE - 1) as f64; // 0.0 to 1.0 (top to bottom).
+    for i in 0..(PATCH_GRID_SIZE - 1) {
+        for j in 0..(PATCH_GRID_SIZE - 1) {
+            for corners in patch_cell_triangles(i, j) {
+                let [v0, v1, v2] = corners.map(|idx| vertices[idx].clone());
+                let mut triangle = Triangle::new(v0, v1, v2);
+                let [p0, p1, p2] =
+                    inflate_triangle([triangle.p0.point, triangle.p1.point, triangle.p2.point]);
+                triangle.p0.point = p0;
+                triangle.p1.point = p1;
+                triangle.p2.point = p2;
 
-            // Map unit square coordinate to patch coordinate.
-            let unit_point = Point::new(u, v);
-            grid[i][j] = map_coordinate(unit_point);
-        }
-    }
-
-    for i in 0..(GRID_SIZE - 1) {
-        for j in 0..(GRID_SIZE - 1) {
-            let p00 = grid[i][j];
-            let p10 = grid[i + 1][j];
-            let p01 = grid[i][j + 1];
-            let p11 = grid[i + 1][j + 1];
-
-            // Calculate unit square coordinates for color interpolation.
-            let u0 = i as f64 / (GRID_SIZE - 1) as f64;
-            let u1 = (i + 1) as f64 / (GRID_SIZE - 1) as f64;
-            let v0 = j as f64 / (GRID_SIZE - 1) as f64;
-            let v1 = (j + 1) as f64 / (GRID_SIZE - 1) as f64;
-
-            // Create triangle vertices with interpolated colors.
-            let v00 = TriangleVertex {
-                flag: 0,
-                point: p00,
-                colors: interpolate(Point::new(u0, v0)),
-            };
-            let v10 = TriangleVertex {
-                flag: 0,
-                point: p10,
-                colors: interpolate(Point::new(u1, v0)),
-            };
-            let v01 = TriangleVertex {
-                flag: 0,
-                point: p01,
-                colors: interpolate(Point::new(u0, v1)),
-            };
-            let v11 = TriangleVertex {
-                flag: 0,
-                point: p11,
-                colors: interpolate(Point::new(u1, v1)),
-            };
-
-            let inflate_point = |p: Point, mid: Point| -> Point {
-                const INFLATION_FACTOR: f64 = 1.025;
-                mid + (p - mid) * INFLATION_FACTOR
-            };
-
-            // Converting to triangles is lossy and can lead to gaps. To make this a bit better,
-            // we slightly inflate the triangles.
-            let inflate = |mut triangle: Triangle| {
-                let mid = triangle.kurbo_tri.centroid();
-                triangle.p0.point = inflate_point(triangle.p0.point, mid);
-                triangle.p1.point = inflate_point(triangle.p1.point, mid);
-                triangle.p2.point = inflate_point(triangle.p2.point, mid);
-
-                triangle
-            };
-
-            buffer.push(inflate(Triangle::new(
-                v00.clone(),
-                v10.clone(),
-                v01.clone(),
-            )));
-            buffer.push(inflate(Triangle::new(
-                v10.clone(),
-                v11.clone(),
-                v01.clone(),
-            )));
+                buffer.push(triangle);
+            }
         }
     }
 }

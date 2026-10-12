@@ -34,7 +34,7 @@ impl Renderer<'_> {
                         const NATIVE_GRADIENT_TOLERANCE: f32 = 0.01;
 
                         clip_path = s.shading.clip_path.clone();
-                        let encoded = s.encode();
+                        let encoded = s.encode_cached(&mut self.global.shading_cache.borrow_mut());
                         let mut bbox = (*path_transform * path_bbox().to_path(0.0)).bounding_box();
 
                         if is_stroke {

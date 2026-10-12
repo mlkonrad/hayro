@@ -1,11 +1,15 @@
 //! Encoding shading patterns for easy sampling.
 
+use crate::CacheKey;
 use crate::color::{AlphaColor, ColorComponents, ColorSpace};
 use crate::interpret::state::ActiveTransferFunction;
 use crate::pattern::ShadingPattern;
-use crate::shading::{ShadingFunction, ShadingType, Triangle};
+use crate::shading::{
+    PATCH_GRID_SIZE, PatchGrid, ShadingFunction, ShadingType, Triangle, inflate_triangle,
+    patch_cell_triangles, patch_grid_point,
+};
 use crate::util::x_y_advances;
-use kurbo::{Affine, Point, Rect};
+use kurbo::{Affine, Point, Rect, Shape};
 use rustc_hash::FxHashMap;
 use smallvec::{ToSmallVec, smallvec};
 use std::sync::Arc;
@@ -55,9 +59,12 @@ pub struct EncodedRadialAxialShading {
 /// Encoded sampled mesh shading.
 #[derive(Clone, Debug)]
 pub struct EncodedSampledShading {
-    pub(crate) samples: Arc<FxHashMap<(u16, u16), ColorComponents>>,
+    pub(crate) samples: Arc<Samples>,
     pub(crate) function: Option<ShadingFunction>,
 }
+
+/// The colors of a mesh shading, sampled at integer device pixel positions.
+type Samples = FxHashMap<(u16, u16), ColorComponents>;
 
 /// Encoded dummy shading.
 #[derive(Clone, Debug)]
@@ -184,9 +191,71 @@ impl EncodedShadingPattern {
     }
 }
 
+/// A cache for the expensive part of encoding mesh shadings, which can be shared across
+/// multiple encodings of the same shading pattern (for example across pages).
+///
+/// The cache evicts the least recently used entries once the total number of cached samples
+/// exceeds a budget.
+#[derive(Default)]
+pub struct SampledShadingCache {
+    entries: FxHashMap<u128, (Arc<Samples>, u64)>,
+    size: usize,
+    clock: u64,
+}
+
+impl SampledShadingCache {
+    /// The maximum total number of cached samples.
+    const BUDGET: usize = 1 << 20;
+
+    fn get_or_insert_with(&mut self, key: u128, compute: impl FnOnce() -> Samples) -> Arc<Samples> {
+        self.clock += 1;
+
+        if let Some((samples, last_used)) = self.entries.get_mut(&key) {
+            *last_used = self.clock;
+            return samples.clone();
+        }
+
+        let samples = Arc::new(compute());
+        let size = samples.len();
+
+        if size <= Self::BUDGET {
+            while self.size + size > Self::BUDGET {
+                let Some((&oldest, _)) = self.entries.iter().min_by_key(|(_, (_, used))| *used)
+                else {
+                    break;
+                };
+                let (evicted, _) = self.entries.remove(&oldest).unwrap();
+                self.size -= evicted.len();
+            }
+
+            self.size += size;
+            self.entries.insert(key, (samples.clone(), self.clock));
+        }
+
+        samples
+    }
+}
+
 impl ShadingPattern {
     /// Encode the shading pattern.
     pub fn encode(&self) -> EncodedShadingPattern {
+        self.encode_impl(None)
+    }
+
+    /// Encode the shading pattern, reusing the samples of mesh shadings from the cache.
+    ///
+    /// The result is the same as for [`ShadingPattern::encode`].
+    pub fn encode_cached(&self, cache: &mut SampledShadingCache) -> EncodedShadingPattern {
+        self.encode_impl(Some(cache))
+    }
+
+    fn encode_impl(&self, mut cache: Option<&mut SampledShadingCache>) -> EncodedShadingPattern {
+        let key = self.cache_key();
+        let mut samples = |compute: &dyn Fn() -> Samples| match cache.as_mut() {
+            Some(cache) => cache.get_or_insert_with(key, compute),
+            None => Arc::new(compute()),
+        };
+
         let base_transform;
 
         let shading_type = match self.shading.shading_type.as_ref() {
@@ -217,44 +286,56 @@ impl ShadingPattern {
                 function,
             } => {
                 let full_transform = self.matrix;
-                let samples = sample_triangles(triangles, full_transform);
+                let samples = samples(&|| sample_triangles(triangles, full_transform));
 
                 base_transform = Affine::IDENTITY;
 
                 EncodedShadingType::Sampled(EncodedSampledShading {
-                    samples: Arc::new(samples),
+                    samples,
                     function: function.clone(),
                 })
             }
             ShadingType::CoonsPatchMesh { patches, function } => {
-                let mut triangles = vec![];
-                for patch in patches {
-                    patch.to_triangles(&mut triangles);
-                }
+                let samples = samples(&|| {
+                    let mut samples = Samples::default();
+                    for patch in patches {
+                        sample_patch(
+                            &patch.grid(),
+                            |p| patch.interpolate(p),
+                            self.matrix,
+                            &mut samples,
+                        );
+                    }
 
-                let full_transform = self.matrix;
-                let samples = sample_triangles(&triangles, full_transform);
+                    samples
+                });
 
                 base_transform = Affine::IDENTITY;
 
                 EncodedShadingType::Sampled(EncodedSampledShading {
-                    samples: Arc::new(samples),
+                    samples,
                     function: function.clone(),
                 })
             }
             ShadingType::TensorProductPatchMesh { patches, function } => {
-                let mut triangles = vec![];
-                for patch in patches {
-                    patch.to_triangles(&mut triangles);
-                }
+                let samples = samples(&|| {
+                    let mut samples = Samples::default();
+                    for patch in patches {
+                        sample_patch(
+                            &patch.grid(),
+                            |p| patch.interpolate(p),
+                            self.matrix,
+                            &mut samples,
+                        );
+                    }
 
-                let full_transform = self.matrix;
-                let samples = sample_triangles(&triangles, full_transform);
+                    samples
+                });
 
                 base_transform = Affine::IDENTITY;
 
                 EncodedShadingType::Sampled(EncodedSampledShading {
-                    samples: Arc::new(samples),
+                    samples,
                     function: function.clone(),
                 })
             }
@@ -329,10 +410,7 @@ fn encode_axial_shading(
     )
 }
 
-fn sample_triangles(
-    triangles: &[Triangle],
-    transform: Affine,
-) -> FxHashMap<(u16, u16), ColorComponents> {
+fn sample_triangles(triangles: &[Triangle], transform: Affine) -> Samples {
     let mut map = FxHashMap::default();
 
     for t in triangles {
@@ -364,6 +442,251 @@ fn sample_triangles(
     }
 
     map
+}
+
+/// Sample the triangles that a patch is converted into (see `CoonsPatch::to_triangles` and
+/// `TensorProductPatch::to_triangles`) at integer device pixel positions.
+///
+/// The result is exactly the same as converting the patch into triangles and passing them to
+/// [`sample_triangles`]: the same floating-point operations are performed as in
+/// `Triangle::new` and `Triangle::interpolate`, in the same order. However, the triangles
+/// are sampled directly instead of being collected first, and the colors of grid points are
+/// only computed for triangles that actually contain a pixel position, which is rare at
+/// typical resolutions.
+fn sample_patch(
+    grid: &PatchGrid,
+    interpolate: impl Fn(Point) -> ColorComponents,
+    transform: Affine,
+    out: &mut Samples,
+) {
+    // The colors of the grid points, computed when they are first needed.
+    let mut colors: Vec<Option<ColorComponents>> = Vec::new();
+    let mut device_grid = [Point::ZERO; PATCH_GRID_SIZE * PATCH_GRID_SIZE];
+    let (mut max_coord, mut max_device_coord) = (0.0_f64, 0.0_f64);
+
+    for (device, p) in device_grid.iter_mut().zip(grid) {
+        *device = transform * *p;
+        max_coord = max_coord.max(p.x.abs().max(p.y.abs()));
+        max_device_coord = max_device_coord.max(device.x.abs().max(device.y.abs()));
+    }
+
+    // An upper bound for the distance between a computed (inflated and) transformed grid
+    // point and its exact value. The rounding error of these few operations is in the order
+    // of 1e-16 relative to the magnitudes involved, so this leaves a wide safety margin.
+    let [a, b, c, d, e, f] = transform.as_coeffs();
+    let epsilon = 1e-12
+        * (1.0 + (a.abs() + b.abs() + c.abs() + d.abs()) * (1.0 + max_coord) + e.abs() + f.abs());
+
+    // Only skip cells if all values are in a range where the reasoning in
+    // `cell_has_no_samples` applies.
+    let can_skip = epsilon.is_finite() && max_device_coord < 65536.0;
+
+    for i in 0..(PATCH_GRID_SIZE - 1) {
+        for j in 0..(PATCH_GRID_SIZE - 1) {
+            let triangles = patch_cell_triangles(i, j);
+
+            if can_skip && cell_has_no_samples(&device_grid, triangles, epsilon) {
+                continue;
+            }
+
+            for corners in triangles {
+                let points = inflate_triangle(corners.map(|idx| grid[idx]));
+
+                for_each_sample(points.map(|p| transform * p), |x, y, (u, v, w)| {
+                    if colors.is_empty() {
+                        colors.resize(grid.len(), None);
+                    }
+
+                    for &idx in &corners {
+                        if colors[idx].is_none() {
+                            colors[idx] = Some(interpolate(patch_grid_point(
+                                idx / PATCH_GRID_SIZE,
+                                idx % PATCH_GRID_SIZE,
+                            )));
+                        }
+                    }
+
+                    let [c0, c1, c2] = corners.map(|idx| colors[idx].as_deref().unwrap());
+                    let mut result = ColorComponents::new();
+                    for i in 0..c0.len() {
+                        result.push(u * c0[i] + v * c1[i] + w * c2[i]);
+                    }
+
+                    out.insert((x, y), result);
+                });
+            }
+        }
+    }
+}
+
+/// Return true if it is guaranteed that none of the two triangles of a grid cell contains
+/// any of the pixel positions that `for_each_sample` tests, so that the cell can be skipped
+/// without changing the result.
+///
+/// `device_grid` contains the transformed (but not inflated) grid points, which must all be
+/// less than 65536 in magnitude, and `epsilon` must be finite. The check is
+/// conservative: it may return false for cells without samples, but never true for cells
+/// with samples, even when accounting for floating-point rounding.
+///
+/// The reasoning is as follows. `for_each_sample` tests the integer positions in
+/// `[floor(x0), ceil(x1)) x [floor(y0), ceil(y1))`, where `(x0, y0, x1, y1)` is the bounding
+/// box of the triangle. If there is no integer within `DELTA` of `[x0, x1]`, all tested
+/// positions are at least `DELTA` to the left or right of the triangle (and analogously for
+/// the y direction). For such a position, at least one barycentric coordinate is at most
+/// `-DELTA / (2 * width)`, so the corresponding cross product computed by `winding` is at
+/// least `DELTA * area / width` in magnitude and has the opposite sign of the triangle's
+/// orientation, while another one is at least `area` in magnitude and has the same sign as
+/// the orientation. If both values exceed the possible rounding error of the computation,
+/// `winding` returns 0. This doesn't hold for (nearly) degenerate triangles, which are
+/// therefore never skipped.
+#[inline(always)]
+fn cell_has_no_samples(device_grid: &[Point], triangles: [[usize; 3]; 2], epsilon: f64) -> bool {
+    const DELTA: f64 = 1e-3;
+    // `PATCH_INFLATION_FACTOR - 1`, rounded up.
+    const INFLATION: f64 = 0.026;
+
+    let corners = [
+        device_grid[triangles[0][0]],
+        device_grid[triangles[0][1]],
+        device_grid[triangles[0][2]],
+        device_grid[triangles[1][1]],
+    ];
+
+    let (mut x0, mut y0, mut x1, mut y1) = (corners[0].x, corners[0].y, corners[0].x, corners[0].y);
+    for p in &corners[1..] {
+        x0 = x0.min(p.x);
+        y0 = y0.min(p.y);
+        x1 = x1.max(p.x);
+        y1 = y1.max(p.y);
+    }
+
+    let (width, height) = (x1 - x0, y1 - y0);
+
+    if !(width + height).is_finite() {
+        return false;
+    }
+
+    // Inflating moves each vertex away from the triangle's centroid (which lies within the
+    // cell) by at most `INFLATION` times its distance to the centroid.
+    let margin = INFLATION * (width + height) + epsilon;
+    let x_clear = !contains_integer(x0 - margin - DELTA, x1 + margin + DELTA);
+
+    if !x_clear && contains_integer(y0 - margin - DELTA, y1 + margin + DELTA) {
+        return false;
+    }
+
+    // The bounding box of each (inflated) triangle is at most this large.
+    let (max_width, max_height) = (width + 2.0 * margin, height + 2.0 * margin);
+    let extent = if x_clear { max_width } else { max_height };
+
+    // An upper bound for the rounding error of a cross product in `winding`, whose inputs
+    // are differences of at most `max_width + max_height + 2` in magnitude.
+    let size = max_width + max_height + 2.0;
+    let cross_error = 1e-13 * size * size;
+    // An upper bound for the difference between the area computed below and the area of the
+    // exact triangle: moving each vertex by at most `epsilon` changes twice the area by at
+    // most `8 * epsilon * (width + height + epsilon)`, plus rounding.
+    let area_error = 8.0 * epsilon * (max_width + max_height + epsilon) + cross_error;
+
+    triangles.iter().all(|t| {
+        let [p0, p1, p2] = t.map(|idx| device_grid[idx]);
+        // Twice the area of the triangle. Inflating can only make it larger.
+        let doubled_area = (p1 - p0).cross(p2 - p0).abs() - area_error;
+
+        doubled_area > 0.0
+            && doubled_area * DELTA > 2.0 * extent * cross_error
+            && doubled_area > 2.0 * cross_error
+    })
+}
+
+/// Return whether there is an integer in `[min, max]`.
+///
+/// Both values must be finite and less than 2^51 in magnitude.
+#[inline(always)]
+fn contains_integer(min: f64, max: f64) -> bool {
+    // Adding and subtracting this constant rounds to the nearest integer, which is much
+    // cheaper than a saturating conversion to an integer type.
+    const ROUND: f64 = 6_755_399_441_055_744.0;
+
+    let rounded = (max + ROUND) - ROUND;
+    let floor = if rounded > max {
+        rounded - 1.0
+    } else {
+        rounded
+    };
+
+    floor >= min
+}
+
+/// Equivalent to `x.floor() as u16`, but without calling into libm in the common case.
+#[inline]
+fn floor_u16(x: f64) -> u16 {
+    // `as` conversions saturate, so only the in-range case needs to be exact.
+    if x.abs() < 65536.0 {
+        let truncated = x as i32;
+        let floor = if (truncated as f64) > x {
+            truncated - 1
+        } else {
+            truncated
+        };
+        floor.clamp(0, i32::from(u16::MAX)) as u16
+    } else {
+        x.floor() as u16
+    }
+}
+
+/// Equivalent to `x.ceil() as u16`, but without calling into libm in the common case.
+#[inline]
+fn ceil_u16(x: f64) -> u16 {
+    if x.abs() < 65536.0 {
+        let truncated = x as i32;
+        let ceil = if (truncated as f64) < x {
+            truncated + 1
+        } else {
+            truncated
+        };
+        ceil.clamp(0, i32::from(u16::MAX)) as u16
+    } else {
+        x.ceil() as u16
+    }
+}
+
+/// Call `f` with the barycentric coordinates of each integer pixel position that the
+/// triangle with the given (device space) points contains, exactly like `sample_triangles`
+/// does for such a triangle.
+#[inline]
+fn for_each_sample(points: [Point; 3], mut f: impl FnMut(u16, u16, (f32, f32, f32))) {
+    let [p0, p1, p2] = points;
+
+    let v0 = p1 - p0;
+    let v1 = p2 - p0;
+    let d00 = v0.dot(v0);
+    let d01 = v0.dot(v1);
+    let d11 = v1.dot(v1);
+
+    let triangle = kurbo::Triangle::new(p0, p1, p2);
+    let bbox = triangle.bounding_box();
+
+    for y in floor_u16(bbox.y0)..ceil_u16(bbox.y1) {
+        for x in floor_u16(bbox.x0)..ceil_u16(bbox.x1) {
+            let pos = Point::new(x as f64, y as f64);
+
+            if triangle.winding(pos) == 0 {
+                continue;
+            }
+
+            let v2 = pos - p0;
+            let d20 = v2.dot(v0);
+            let d21 = v2.dot(v1);
+
+            let denom = d00 * d11 - d01 * d01;
+            let v = (d11 * d20 - d01 * d21) / denom;
+            let w = (d00 * d21 - d01 * d20) / denom;
+            let u = (1.0 - v - w) as f32;
+
+            f(x, y, (u, v as f32, w as f32));
+        }
+    }
 }
 
 fn encode_function_shading(domain: &[f32; 4], function: &ShadingFunction) -> EncodedShadingType {
