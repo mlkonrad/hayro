@@ -137,19 +137,27 @@ impl CalRgb {
         Self::matrix_product(&Self::BRADFORD_SCALE_INVERSE_MATRIX, &lms_d65)
     }
 
-    fn convert_pixel(&self, input: [u8; 3]) -> [u8; 3] {
-        let input = [
-            input[0] as f32 / 255.0,
-            input[1] as f32 / 255.0,
-            input[2] as f32 / 255.0,
-        ];
+    /// Apply the gamma of the given channel to a component.
+    #[inline]
+    fn apply_gamma(&self, channel: usize, value: u8) -> f32 {
+        let value = value as f32 / 255.0;
+        if value == 1.0 {
+            1.0
+        } else {
+            value.powf(self.gamma[channel])
+        }
+    }
 
-        let [r, g, b] = input;
-        let [gr, gg, gb] = self.gamma;
+    /// The results of `apply_gamma` for all possible input values.
+    fn gamma_tables(&self) -> [[f32; 256]; 3] {
+        std::array::from_fn(|channel| std::array::from_fn(|i| self.apply_gamma(channel, i as u8)))
+    }
+
+    fn convert_pixel(&self, input: [u8; 3], gamma_tables: &[[f32; 256]; 3]) -> [u8; 3] {
         let [agr, bgg, cgb] = [
-            if r == 1.0 { 1.0 } else { r.powf(gr) },
-            if g == 1.0 { 1.0 } else { g.powf(gg) },
-            if b == 1.0 { 1.0 } else { b.powf(gb) },
+            gamma_tables[0][usize::from(input[0])],
+            gamma_tables[1][usize::from(input[1])],
+            gamma_tables[2][usize::from(input[2])],
         ];
 
         let m = &self.matrix;
@@ -171,25 +179,100 @@ impl CalRgb {
     }
 }
 
+impl CalRgb {
+    /// Convert all pixels, reusing the results of recently seen colors (the result only
+    /// depends on the input color).
+    fn convert_all<'a>(&self, pixels: impl Iterator<Item = ([u8; 3], &'a mut [u8; 3])>) {
+        const MEMO_SIZE: usize = 4096;
+
+        let gamma_tables = self.gamma_tables();
+        let mut memo = vec![(u32::MAX, [0_u8; 3]); MEMO_SIZE];
+
+        for (input, output) in pixels {
+            let key = u32::from_le_bytes([input[0], input[1], input[2], 0]);
+            let slot = &mut memo[(key.wrapping_mul(0x9E37_79B1) >> 20) as usize % MEMO_SIZE];
+
+            if slot.0 != key {
+                *slot = (key, self.convert_pixel(input, &gamma_tables));
+            }
+
+            *output = slot.1;
+        }
+    }
+}
+
 impl ToRgb for CalRgb {
     fn convert(&self, input: &[u8], output: &mut [u8]) -> Option<()> {
-        for (input, output) in input
-            .as_chunks::<3>()
-            .0
-            .iter()
-            .zip(output.as_chunks_mut::<3>().0)
-        {
-            *output = self.convert_pixel(*input);
-        }
+        self.convert_all(
+            input
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .copied()
+                .zip(output.as_chunks_mut::<3>().0),
+        );
 
         Some(())
     }
 
     fn convert_in_place(&self, input: &mut [u8]) -> Option<()> {
+        let gamma_tables = self.gamma_tables();
         for input in input.as_chunks_mut::<3>().0 {
-            *input = self.convert_pixel(*input);
+            *input = self.convert_pixel(*input, &gamma_tables);
         }
 
         Some(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CalRgb;
+    use crate::color::ToRgb;
+
+    /// The previous implementation, for comparison.
+    fn convert_pixel_reference(cs: &CalRgb, input: [u8; 3]) -> [u8; 3] {
+        let tables = cs.gamma_tables();
+        let [r, g, b] = input.map(|v| v as f32 / 255.0);
+        let [gr, gg, gb] = cs.gamma;
+        let direct = [
+            if r == 1.0 { 1.0 } else { r.powf(gr) },
+            if g == 1.0 { 1.0 } else { g.powf(gg) },
+            if b == 1.0 { 1.0 } else { b.powf(gb) },
+        ];
+        // The tables must contain exactly the same values.
+        for (c, v) in input.iter().enumerate() {
+            assert_eq!(tables[c][usize::from(*v)].to_bits(), direct[c].to_bits());
+        }
+        cs.convert_pixel(input, &tables)
+    }
+
+    #[test]
+    fn memoized_conversion_matches() {
+        let cs = CalRgb {
+            white_point: [0.9505, 1.0, 1.089],
+            black_point: [0.0, 0.0, 0.0],
+            matrix: [
+                0.4124, 0.2126, 0.0193, 0.3576, 0.7152, 0.1192, 0.1805, 0.0722, 0.9505,
+            ],
+            gamma: [2.2, 1.8, 2.4],
+        };
+
+        // Many pixels, with repeated colors and memo collisions.
+        let input: Vec<u8> = (0..300_000_u32)
+            .flat_map(|i| {
+                let v = i.wrapping_mul(2_654_435_761) % 5000;
+                [(v % 256) as u8, (v / 7 % 256) as u8, (i % 256) as u8]
+            })
+            .collect();
+        let mut output = vec![0; input.len()];
+        cs.convert(&input, &mut output).unwrap();
+
+        for (i, o) in input.chunks_exact(3).zip(output.chunks_exact(3)) {
+            assert_eq!(
+                convert_pixel_reference(&cs, [i[0], i[1], i[2]]),
+                [o[0], o[1], o[2]]
+            );
+        }
     }
 }

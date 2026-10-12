@@ -796,88 +796,168 @@ fn apply_predictor(data: Vec<u8>, params: &PredictorParams) -> Option<Vec<u8>> {
                 );
             }
 
-            let zero_row = vec![0; row_len];
-            let mut prev_row = BitChunks::new(&zero_row, bit_size, chunk_len)?;
-            let zero_col = BitChunk::new(0, chunk_len);
-            let mut out = vec![0; num_rows * row_len];
-            let mut writer = BitWriter::new(&mut out, bit_size)?;
-
-            for in_row in data.chunks_exact(total_row_len) {
-                if is_png_predictor {
-                    let predictor = in_row[0];
-                    let in_data = &in_row[1..];
-                    let in_data_chunks = BitChunks::new(in_data, bit_size, chunk_len)?;
-
-                    match predictor {
-                        1 => apply::<Sub>(
-                            prev_row,
-                            zero_col.clone(),
-                            zero_col.clone(),
-                            in_data_chunks,
-                            &mut writer,
-                            chunk_len,
-                            bit_size,
-                        )?,
-                        2 => apply::<Up>(
-                            prev_row,
-                            zero_col.clone(),
-                            zero_col.clone(),
-                            in_data_chunks,
-                            &mut writer,
-                            chunk_len,
-                            bit_size,
-                        )?,
-                        3 => apply::<Avg>(
-                            prev_row,
-                            zero_col.clone(),
-                            zero_col.clone(),
-                            in_data_chunks,
-                            &mut writer,
-                            chunk_len,
-                            bit_size,
-                        )?,
-                        4 => apply::<Paeth>(
-                            prev_row,
-                            zero_col.clone(),
-                            zero_col.clone(),
-                            in_data_chunks,
-                            &mut writer,
-                            chunk_len,
-                            bit_size,
-                        )?,
-                        _ => {
-                            // Just copy the data.
-                            let mut reader = BitReader::new(in_data);
-
-                            while let Some(data) = reader.read(bit_size) {
-                                writer.write(data);
-                            }
-                        }
-                    }
-                } else if i == 2 {
-                    apply::<Sub>(
-                        prev_row,
-                        zero_col.clone(),
-                        zero_col.clone(),
-                        BitChunks::new(in_row, bit_size, chunk_len)?,
-                        &mut writer,
-                        chunk_len,
-                        bit_size,
-                    );
-                } else {
-                    warn!("unknown predictor {i}");
-
-                    return None;
-                }
-
-                let (data, new_writer) = writer.split_off();
-                writer = new_writer;
-                prev_row = BitChunks::new(data, bit_size, chunk_len)?;
+            // TIFF predictor for samples that are packed into bytes, which is common for
+            // bilevel images.
+            if !is_png_predictor
+                && i == 2
+                && bit_size < 8
+                && chunk_len > 0
+                && 8 % (bit_size as usize * chunk_len) == 0
+            {
+                return Some(apply_tiff_predictor_packed(
+                    &data, row_len, num_rows, bit_size, chunk_len,
+                ));
             }
 
-            Some(out)
+            apply_predictor_generic(
+                &data,
+                i,
+                is_png_predictor,
+                row_len,
+                total_row_len,
+                num_rows,
+                bit_size,
+                chunk_len,
+            )
         }
     }
+}
+
+/// Apply the TIFF predictor to samples with less than 8 bits, if a pixel evenly divides a
+/// byte.
+///
+/// In this case, every row consists of whole pixels (including padding), so this produces
+/// exactly the same output as [`apply_predictor_generic`].
+fn apply_tiff_predictor_packed(
+    data: &[u8],
+    row_len: usize,
+    num_rows: usize,
+    bit_size: u8,
+    colors: usize,
+) -> Vec<u8> {
+    let bits = bit_size as usize;
+    let mask = bit_mask(bit_size) as u8;
+    let samples_per_byte = 8 / bits;
+    let mut out = vec![0; num_rows * row_len];
+
+    for (in_row, out_row) in data
+        .chunks_exact(row_len)
+        .take(num_rows)
+        .zip(out.chunks_exact_mut(row_len))
+    {
+        // The previous pixel, which is zero at the start of each row.
+        let mut prev = [0_u8; 8];
+        let mut component = 0;
+
+        for (in_byte, out_byte) in in_row.iter().zip(out_row.iter_mut()) {
+            let mut byte = 0;
+
+            for k in 0..samples_per_byte {
+                let shift = 8 - bits * (k + 1);
+                let value = ((in_byte >> shift) & mask).wrapping_add(prev[component]) & mask;
+                prev[component] = value;
+                byte |= value << shift;
+                component = (component + 1) % colors;
+            }
+
+            *out_byte = byte;
+        }
+    }
+
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_predictor_generic(
+    data: &[u8],
+    i: u8,
+    is_png_predictor: bool,
+    row_len: usize,
+    total_row_len: usize,
+    num_rows: usize,
+    bit_size: u8,
+    chunk_len: usize,
+) -> Option<Vec<u8>> {
+    let zero_row = vec![0; row_len];
+    let mut prev_row = BitChunks::new(&zero_row, bit_size, chunk_len)?;
+    let zero_col = BitChunk::new(0, chunk_len);
+    let mut out = vec![0; num_rows * row_len];
+    let mut writer = BitWriter::new(&mut out, bit_size)?;
+
+    for in_row in data.chunks_exact(total_row_len) {
+        if is_png_predictor {
+            let predictor = in_row[0];
+            let in_data = &in_row[1..];
+            let in_data_chunks = BitChunks::new(in_data, bit_size, chunk_len)?;
+
+            match predictor {
+                1 => apply::<Sub>(
+                    prev_row,
+                    zero_col.clone(),
+                    zero_col.clone(),
+                    in_data_chunks,
+                    &mut writer,
+                    chunk_len,
+                    bit_size,
+                )?,
+                2 => apply::<Up>(
+                    prev_row,
+                    zero_col.clone(),
+                    zero_col.clone(),
+                    in_data_chunks,
+                    &mut writer,
+                    chunk_len,
+                    bit_size,
+                )?,
+                3 => apply::<Avg>(
+                    prev_row,
+                    zero_col.clone(),
+                    zero_col.clone(),
+                    in_data_chunks,
+                    &mut writer,
+                    chunk_len,
+                    bit_size,
+                )?,
+                4 => apply::<Paeth>(
+                    prev_row,
+                    zero_col.clone(),
+                    zero_col.clone(),
+                    in_data_chunks,
+                    &mut writer,
+                    chunk_len,
+                    bit_size,
+                )?,
+                _ => {
+                    // Just copy the data.
+                    let mut reader = BitReader::new(in_data);
+
+                    while let Some(data) = reader.read(bit_size) {
+                        writer.write(data);
+                    }
+                }
+            }
+        } else if i == 2 {
+            apply::<Sub>(
+                prev_row,
+                zero_col.clone(),
+                zero_col.clone(),
+                BitChunks::new(in_row, bit_size, chunk_len)?,
+                &mut writer,
+                chunk_len,
+                bit_size,
+            );
+        } else {
+            warn!("unknown predictor {i}");
+
+            return None;
+        }
+
+        let (data, new_writer) = writer.split_off();
+        writer = new_writer;
+        prev_row = BitChunks::new(data, bit_size, chunk_len)?;
+    }
+
+    Some(out)
 }
 
 fn apply_predictor_8bit_png(
@@ -1027,7 +1107,32 @@ impl Predictor for Paeth {
 #[cfg(test)]
 #[rustfmt::skip]
 mod tests {
-    use crate::filter::lzw_flate::{PredictorParams, apply_predictor, flate, lzw};
+    use crate::filter::lzw_flate::{PredictorParams, apply_predictor, apply_predictor_generic, apply_tiff_predictor_packed, flate, lzw};
+
+    #[test]
+    fn tiff_predictor_packed_matches_generic() {
+        let mut state = 0x1234_5678_u32;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state as u8
+        };
+
+        for (bits, colors) in [(1, 1), (1, 2), (1, 4), (1, 8), (2, 1), (2, 2), (2, 4), (4, 1), (4, 2)] {
+            for columns in [1_usize, 2, 3, 5, 7, 8, 13, 64, 211] {
+                let row_len = (columns * colors * bits).div_ceil(8);
+                let num_rows = 9;
+                // Also include a partial row at the end.
+                let data: Vec<u8> = (0..row_len * num_rows + row_len / 2).map(|_| next()).collect();
+
+                let fast = apply_tiff_predictor_packed(&data, row_len, num_rows, bits as u8, colors);
+                let generic = apply_predictor_generic(&data, 2, false, row_len, row_len, num_rows, bits as u8, colors);
+
+                assert_eq!(Some(fast), generic, "bits {bits}, colors {colors}, columns {columns}");
+            }
+        }
+    }
     use crate::object::Dict;
 
     #[test]

@@ -173,6 +173,33 @@ fn decode_u8_samples(
     };
 
     match bits_per_component {
+        1 | 2 | 4 => {
+            // Samples that are packed into bytes. The decoded value only depends on the
+            // sample value and the component, so it can be looked up.
+            let num_values = 1_usize << bits_per_component;
+            let table = (0..num_components)
+                .map(|component| {
+                    (0..num_values)
+                        .map(|value| decode_component(value as u32, component))
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+
+            let mut buf = Vec::with_capacity(capacity);
+            for_each_packed_sample(
+                data,
+                width,
+                height,
+                num_components,
+                bits_per_component,
+                |value, component| {
+                    buf.push(table[component][value as usize]?);
+                    Some(())
+                },
+            )?;
+
+            Some(buf)
+        }
         1..8 | 9..16 => {
             let mut buf = Vec::with_capacity(capacity);
             for_each_sample(
@@ -253,6 +280,47 @@ fn unpack_samples(
     }
 }
 
+/// Like [`for_each_sample`] for 1, 2 or 4 bits per component, but passes the component
+/// index (instead of the sample index) to the callback.
+fn for_each_packed_sample(
+    data: &[u8],
+    width: u32,
+    height: u32,
+    num_components: usize,
+    bits_per_component: u8,
+    mut visit: impl FnMut(u8, usize) -> Option<()>,
+) -> Option<()> {
+    debug_assert!(matches!(bits_per_component, 1 | 2 | 4));
+
+    let bits = bits_per_component as usize;
+    let mask = (1_u8 << bits_per_component) - 1;
+    let samples_per_row = width as usize * num_components;
+    // Each row starts at a byte boundary.
+    let row_bytes = (samples_per_row * bits).div_ceil(8);
+
+    for row in 0..height as usize {
+        let row_start = row * row_bytes;
+        let mut component = 0;
+
+        for sample in 0..samples_per_row {
+            let bit_offset = sample * bits;
+            // Like when reading with a `BitReader`, missing data is treated as zero.
+            let value = data
+                .get(row_start + bit_offset / 8)
+                .map(|byte| (byte >> (8 - bits - bit_offset % 8)) & mask)
+                .unwrap_or(0);
+
+            visit(value, component)?;
+            component += 1;
+            if component == num_components {
+                component = 0;
+            }
+        }
+    }
+
+    Some(())
+}
+
 fn for_each_sample(
     data: &[u8],
     width: u32,
@@ -278,4 +346,47 @@ fn for_each_sample(
     }
 
     Some(())
+}
+
+#[cfg(test)]
+mod packed_tests {
+    use super::{for_each_packed_sample, for_each_sample};
+
+    #[test]
+    fn packed_samples_match_bit_reader() {
+        let data: Vec<u8> = (0..997_u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+            .collect();
+
+        for bits in [1_u8, 2, 4] {
+            for components in [1_usize, 2, 3, 4] {
+                for (width, height) in [(1, 1), (3, 5), (7, 9), (13, 40), (100, 30)] {
+                    // Also include data that is too short.
+                    for len in [data.len(), 17] {
+                        let mut expected = vec![];
+                        for_each_sample(&data[..len], width, height, components, bits, |v, i| {
+                            expected.push((v as u8, i % components));
+                            Some(())
+                        });
+                        let mut actual = vec![];
+                        for_each_packed_sample(
+                            &data[..len],
+                            width,
+                            height,
+                            components,
+                            bits,
+                            |v, c| {
+                                actual.push((v, c));
+                                Some(())
+                            },
+                        );
+                        assert_eq!(
+                            expected, actual,
+                            "bits {bits}, components {components}, {width}x{height}, len {len}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
