@@ -190,7 +190,7 @@ fn draw_soft_mask(
 /// chunks of gray pixels are looked up in a table, and the remaining chunks are processed in
 /// fixed-size batches that the compiler can vectorize. The floating-point operations are
 /// exactly the same as in Vello, so the result is bit-identical.
-fn luminance_mask_data(pix: &Pixmap) -> Vec<u8> {
+pub(crate) fn luminance_mask_data(pix: &Pixmap) -> Vec<u8> {
     const CHUNK: usize = 16;
     // The red, green and blue bytes of a pixel stored in a little-endian `u32`.
     const RGB_BITS: u32 = 0x00FF_FFFF;

@@ -7,7 +7,7 @@ use hayro_interpret::{CacheKey, Paint};
 use kurbo::{Affine, BezPath, Rect, Shape};
 use rustc_hash::FxHashMap;
 use std::sync::Arc;
-use vello_cpu::color::{AlphaColor, DynamicColor, Srgb};
+use vello_cpu::color::{AlphaColor, DynamicColor, PremulRgba8, Srgb};
 use vello_cpu::peniko::{ColorStop, Gradient, ImageQuality, ImageSampler};
 use vello_cpu::{Image, ImageSource, PaintType, PixelMetadata, Pixmap, peniko};
 
@@ -178,13 +178,24 @@ impl Renderer<'_> {
                                 let mut image =
                                     Vec::with_capacity(width as usize * height as usize);
                                 let mut may_have_transparency = false;
+                                // Neighboring pixels often have the same color, so remember the
+                                // last conversion.
+                                let mut last: Option<([u32; 4], PremulRgba8)> = None;
                                 let (width, height, transform) =
-                                    encoded.sample_texture(bbox, 1.0, |sample| {
-                                        let pixel = AlphaColor::<Srgb>::new(sample)
-                                            .premultiply()
-                                            .to_rgba8();
+                                    encoded.sample_texture_runs(bbox, 1.0, |sample, count| {
+                                        let bits = sample.map(f32::to_bits);
+                                        let pixel = match last {
+                                            Some((last_bits, pixel)) if last_bits == bits => pixel,
+                                            _ => {
+                                                let pixel = AlphaColor::<Srgb>::new(sample)
+                                                    .premultiply()
+                                                    .to_rgba8();
+                                                last = Some((bits, pixel));
+                                                pixel
+                                            }
+                                        };
                                         may_have_transparency |= pixel.a != 255;
-                                        image.push(pixel);
+                                        image.extend(std::iter::repeat_n(pixel, count as usize));
                                     });
 
                                 let pixmap = Arc::new(Pixmap::from_parts(

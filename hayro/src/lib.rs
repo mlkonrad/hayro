@@ -75,6 +75,7 @@ pub(crate) struct GlobalState {
     soft_mask_cache: Rc<RefCell<mask::SoftMaskCache>>,
     shading_cache: Rc<RefCell<SampledShadingCache>>,
     texture_cache: Rc<RefCell<paint::TextureCache>>,
+    image_cache: Rc<RefCell<image::ImageCache>>,
     /// A pixmap that can be reused for rendering soft masks.
     mask_pixmap: Cell<Option<Pixmap>>,
     scaler: Scaler,
@@ -89,6 +90,7 @@ impl GlobalState {
             soft_mask_cache: cache.soft_mask_cache.clone(),
             shading_cache: cache.shading_cache.clone(),
             texture_cache: cache.texture_cache.clone(),
+            image_cache: cache.image_cache.clone(),
             mask_pixmap: Cell::new(None),
             scaler: Scaler::new(image::RESAMPLING_FUNCTION),
             force_image_interpolation: settings.force_image_interpolation,
@@ -107,6 +109,8 @@ pub(crate) struct Renderer<'a> {
     /// a soft mask or pattern can render differently because of nesting limits.
     pub(crate) share_soft_masks: bool,
     pub(crate) in_type3_glyph: bool,
+    /// Records the operations of the image that is currently drawn, if any.
+    pub(crate) image_recorder: Option<image::ImageRecorder>,
 }
 
 impl<'r> Renderer<'r> {
@@ -118,6 +122,7 @@ impl<'r> Renderer<'r> {
             soft_mask_cache: FxHashMap::default(),
             share_soft_masks: false,
             in_type3_glyph: false,
+            image_recorder: None,
         }
     }
 
@@ -199,6 +204,7 @@ pub struct RenderCache<'a> {
     pub(crate) soft_mask_cache: Rc<RefCell<mask::SoftMaskCache>>,
     pub(crate) shading_cache: Rc<RefCell<SampledShadingCache>>,
     pub(crate) texture_cache: Rc<RefCell<paint::TextureCache>>,
+    pub(crate) image_cache: Rc<RefCell<image::ImageCache>>,
 }
 
 impl<'a> RenderCache<'a> {
@@ -210,6 +216,7 @@ impl<'a> RenderCache<'a> {
             soft_mask_cache: Rc::new(RefCell::new(mask::SoftMaskCache::default())),
             shading_cache: Rc::new(RefCell::new(SampledShadingCache::default())),
             texture_cache: Rc::new(RefCell::new(paint::TextureCache::default())),
+            image_cache: Rc::new(RefCell::new(image::ImageCache::default())),
         }
     }
 }

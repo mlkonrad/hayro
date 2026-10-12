@@ -6,6 +6,7 @@ use crate::color::ColorSpace;
 use crate::context::Context;
 use crate::device::Device;
 use crate::interpret::state::ActiveTransferFunction;
+use crate::util::hash128;
 use crate::{BlendMode, CacheKey, Image, ImageDrawProps, RasterImage, StencilImage};
 use hayro_syntax::object::dict::keys::*;
 use hayro_syntax::object::{Name, Object, Stream};
@@ -22,6 +23,8 @@ pub(crate) struct ImageXObject<'a> {
     pub(crate) stream: Stream<'a>,
     pub(crate) transfer_function: Option<ActiveTransferFunction>,
     pub(crate) warning_sink: WarningSinkFn,
+    /// Whether the color space was looked up by name in the current resources.
+    color_space_from_resources: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -82,6 +85,7 @@ impl<'a> ImageXObject<'a> {
             kind = ImageKind::StencilMask;
         }
 
+        let mut color_space_from_resources = false;
         let image_cs = if kind.is_mask() {
             // Masks are always single-channel.
             Some(ColorSpace::device_gray())
@@ -100,6 +104,7 @@ impl<'a> ImageXObject<'a> {
                     cs_obj
                         .and_then(|c| c.into_name())
                         .and_then(|n| resolve_cs(&n))
+                        .inspect(|_| color_space_from_resources = true)
                 })
         };
 
@@ -125,6 +130,7 @@ impl<'a> ImageXObject<'a> {
             interpolate,
             stream: stream.clone(),
             kind,
+            color_space_from_resources,
         })
     }
 
@@ -204,6 +210,21 @@ impl<'a> ImageXObject<'a> {
         }
 
         decode_mask(self, target_dimension)
+    }
+
+    /// Return a key that identifies the decoded version of this image, if it doesn't depend on
+    /// the context the image is drawn in.
+    pub(crate) fn render_cache_key(&self) -> Option<u128> {
+        if self.transfer_function.is_some() || self.color_space_from_resources {
+            return None;
+        }
+
+        // The cache key of the stream only covers its dictionary, not its content.
+        Some(hash128(&(
+            self.stream.cache_key(),
+            self.stream.raw_data().as_ref(),
+            self.kind == ImageKind::Image,
+        )))
     }
 
     pub(crate) fn decoded_image(

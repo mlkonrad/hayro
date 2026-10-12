@@ -80,6 +80,24 @@ impl Samples {
         }
     }
 
+    /// The bounds `[x0, y0, x1, y1]` (with exclusive maximum) of the positions that have a
+    /// sample, or `None` if there are no samples.
+    fn bounds(&self) -> Option<[u32; 4]> {
+        match self {
+            Self::Sparse(map) => map.keys().fold(None, |bounds, &(x, y)| {
+                let (x, y) = (u32::from(x), u32::from(y));
+                let [x0, y0, x1, y1] = bounds.unwrap_or([x, y, x + 1, y + 1]);
+                Some([x0.min(x), y0.min(y), x1.max(x + 1), y1.max(y + 1)])
+            }),
+            Self::Dense(dense) => Some([
+                u32::from(dense.x0),
+                u32::from(dense.y0),
+                u32::from(dense.x0) + dense.width as u32,
+                u32::from(dense.y0) + dense.height as u32,
+            ]),
+        }
+    }
+
     /// An estimate of the memory used by the samples, in bytes.
     fn size(&self) -> usize {
         match self {
@@ -165,8 +183,16 @@ impl EncodedShadingPattern {
     /// Sample the shading at the given position.
     #[inline]
     pub fn sample(&self, pos: Point) -> [f32; 4] {
-        self.shading_type
-            .eval(pos, self.background_color, &self.color_space)
+        self.finish_sample(
+            self.shading_type
+                .eval(pos, self.background_color, &self.color_space),
+        )
+    }
+
+    /// Apply the opacity and transfer function to an evaluated color.
+    #[inline]
+    fn finish_sample(&self, color: Option<AlphaColor>) -> [f32; 4] {
+        color
             .map(|v| {
                 let mut components = v.components();
                 components[3] *= self.opacity;
@@ -195,6 +221,21 @@ impl EncodedShadingPattern {
         scale: f32,
         mut f: impl FnMut([f32; 4]),
     ) -> (u32, u32, Affine) {
+        self.sample_texture_runs(bbox, scale, |sample, count| {
+            for _ in 0..count {
+                f(sample);
+            }
+        })
+    }
+
+    /// Like [`sample_texture`](Self::sample_texture), but the callback is invoked with runs of
+    /// consecutive pixels (in row-major order) that have the same sample.
+    pub fn sample_texture_runs(
+        &self,
+        bbox: Rect,
+        scale: f32,
+        mut f: impl FnMut([f32; 4], u32),
+    ) -> (u32, u32, Affine) {
         let (width, height) = texture_dimensions(bbox, scale);
         let inv_scale = 1.0 / scale as f64;
 
@@ -205,13 +246,64 @@ impl EncodedShadingPattern {
             * Affine::translate((0.5 * inv_scale, 0.5 * inv_scale))
             * Point::new(bbox.x0, bbox.y0);
 
+        // Sampled (mesh) shadings often only cover a small part of the area. Outside of the
+        // area that contains samples, every position evaluates to the background color, so
+        // it only needs to be computed once.
+        let sampled = match &self.shading_type {
+            EncodedShadingType::Sampled(sampled) => Some((
+                sampled.samples.bounds(),
+                self.finish_sample(Some(self.background_color)),
+            )),
+            _ => None,
+        };
+
         for _ in 0..height {
             let mut point = start_point;
 
-            for _ in 0..width {
-                f(self.sample(point));
+            match &sampled {
+                Some((bounds, background)) => {
+                    // Same conversion as when looking up a sample.
+                    let pos = |p: Point| (u32::from(p.x as u16), u32::from(p.y as u16));
+                    let inside = |(x, y): (u32, u32)| {
+                        bounds
+                            .is_some_and(|[x0, y0, x1, y1]| x >= x0 && x < x1 && y >= y0 && y < y1)
+                    };
+                    let row_outside = x_advance.y == 0.0
+                        && !bounds.is_some_and(|[_, y0, _, y1]| {
+                            let y = pos(point).1;
+                            y >= y0 && y < y1
+                        });
 
-                point += x_advance;
+                    if row_outside {
+                        f(*background, width);
+                    } else {
+                        let mut run = 0;
+
+                        for _ in 0..width {
+                            if inside(pos(point)) {
+                                if run > 0 {
+                                    f(*background, run);
+                                    run = 0;
+                                }
+                                f(self.sample(point), 1);
+                            } else {
+                                run += 1;
+                            }
+
+                            point += x_advance;
+                        }
+
+                        if run > 0 {
+                            f(*background, run);
+                        }
+                    }
+                }
+                None => {
+                    for _ in 0..width {
+                        f(self.sample(point), 1);
+                        point += x_advance;
+                    }
+                }
             }
 
             start_point += y_advance;

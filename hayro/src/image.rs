@@ -6,6 +6,7 @@ use kurbo::{Affine, Rect};
 use pic_scale::{
     ImageSize, ImageStore, ImageStoreMut, PicScaleError, Resampling, ResamplingFunction, Scaler,
 };
+use rustc_hash::FxHashMap;
 use std::sync::Arc;
 use vello_cpu::peniko::{Compose, Fill, ImageQuality, ImageSampler, Mix};
 use vello_cpu::{Image, ImageSource, Mask, PixelMetadata, Pixmap, peniko};
@@ -80,6 +81,308 @@ impl RenderImageData {
     }
 }
 
+/// Identifies how an image is drawn, independently of its position.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub(crate) struct ImageDrawKey {
+    image: u128,
+    /// The color of a stencil image.
+    color: Option<[u8; 3]>,
+    target: (u32, u32),
+    in_type3_glyph: bool,
+    force_interpolation: bool,
+}
+
+/// Whether and to which size an image is resampled before drawing it with a transform.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ResizePlan {
+    needs_resize: bool,
+    width: u32,
+    height: u32,
+}
+
+impl ResizePlan {
+    fn new(transform: &Affine, img_width: u32, img_height: u32) -> Self {
+        let (x_scale, y_scale) = {
+            let (x, y) = x_y_advances(transform);
+            (x.length() as f32, y.length() as f32)
+        };
+        let needs_resize = x_scale < 1.0 || y_scale < 1.0;
+        let (width, height) = if needs_resize {
+            let w = (img_width as f32 * x_scale)
+                .ceil()
+                .max(1.0)
+                .min((u16::MAX / 2) as f32) as u32;
+            let h = (img_height as f32 * y_scale)
+                .ceil()
+                .max(1.0)
+                .min((u16::MAX / 2) as f32) as u32;
+            (w, h)
+        } else {
+            (img_width, img_height)
+        };
+
+        Self {
+            needs_resize,
+            width,
+            height,
+        }
+    }
+}
+
+/// A recorded operation on the render context while drawing an image.
+///
+/// Transforms are stored as a chain of factors that are applied to the transform the image
+/// is drawn with, in the same order as when drawing the image, so that replaying the
+/// operations with another transform produces exactly the same result as drawing the
+/// image with that transform.
+pub(crate) enum ImageOp {
+    /// A condition for reusing the recording: the image must be resampled the same way
+    /// when drawn with the transform given by the chain.
+    Check {
+        chain: Vec<Affine>,
+        image_size: (u32, u32),
+        plan: ResizePlan,
+    },
+    SetTransform(Vec<Affine>),
+    PushLayer,
+    PushDestInLayer,
+    PopLayer,
+    DrawPixmap {
+        pixmap: Arc<Pixmap>,
+        quality: ImageQuality,
+        chain: Vec<Affine>,
+    },
+}
+
+fn apply_chain(base: Affine, chain: &[Affine]) -> Affine {
+    chain.iter().fold(base, |acc, f| acc * *f)
+}
+
+/// Records the operations performed while drawing an image.
+pub(crate) struct ImageRecorder {
+    base: Affine,
+    ops: Vec<ImageOp>,
+    /// The chain that produces the current transform of the render context.
+    chain: Vec<Affine>,
+    /// Whether all operations could be recorded faithfully.
+    valid: bool,
+}
+
+impl ImageRecorder {
+    fn new(base: Affine) -> Self {
+        Self {
+            base,
+            ops: vec![],
+            chain: vec![],
+            valid: true,
+        }
+    }
+
+    /// Check that the chain reproduces the transform that was actually used.
+    fn check(&mut self, chain: &[Affine], transform: Affine) {
+        let replayed = apply_chain(self.base, chain).as_coeffs().map(f64::to_bits);
+        if replayed != transform.as_coeffs().map(f64::to_bits) {
+            self.valid = false;
+        }
+    }
+
+    fn finish(self) -> Option<Recording> {
+        self.valid.then(|| Arc::new(self.ops))
+    }
+}
+
+/// The operations of a recorded image draw.
+type Recording = Arc<Vec<ImageOp>>;
+
+/// The total size of the pixmaps of a recording, in bytes.
+fn recording_size(ops: &[ImageOp]) -> usize {
+    ops.iter()
+        .map(|op| match op {
+            ImageOp::DrawPixmap { pixmap, .. } => {
+                usize::from(pixmap.width()) * usize::from(pixmap.height()) * 4
+            }
+            _ => 0,
+        })
+        .sum()
+}
+
+/// A cache of recorded image draws that is shared across the pages of a document,
+/// evicting the least recently used entries once their pixmaps exceed a budget.
+#[derive(Default)]
+pub(crate) struct ImageCache {
+    entries: FxHashMap<ImageDrawKey, (Vec<Recording>, usize, u64)>,
+    size: usize,
+    clock: u64,
+}
+
+impl ImageCache {
+    /// The maximum total size of the cached pixmaps, in bytes.
+    const BUDGET: usize = 128 * 1024 * 1024;
+    /// The maximum number of recordings per key (for different resampling plans).
+    const MAX_VARIANTS: usize = 4;
+
+    /// Return the recordings for the key.
+    fn get(&mut self, key: &ImageDrawKey) -> Vec<Recording> {
+        self.clock += 1;
+
+        match self.entries.get_mut(key) {
+            Some((variants, _, last_used)) => {
+                *last_used = self.clock;
+                variants.clone()
+            }
+            None => vec![],
+        }
+    }
+
+    fn insert(&mut self, key: ImageDrawKey, ops: Recording) {
+        let size = recording_size(&ops);
+
+        if size > Self::BUDGET {
+            return;
+        }
+
+        while self.size + size > Self::BUDGET {
+            let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, (_, _, used))| *used)
+                .map(|(k, _)| k.clone())
+            else {
+                break;
+            };
+            let (_, evicted, _) = self.entries.remove(&oldest).unwrap();
+            self.size -= evicted;
+        }
+
+        self.clock += 1;
+        let clock = self.clock;
+        let entry = self.entries.entry(key).or_insert((vec![], 0, clock));
+
+        if entry.0.len() >= Self::MAX_VARIANTS {
+            let removed_size = recording_size(&entry.0.remove(0));
+            entry.1 -= removed_size;
+            self.size -= removed_size;
+        }
+
+        entry.0.push(ops);
+        entry.1 += size;
+        entry.2 = clock;
+        self.size += size;
+    }
+}
+
+/// Return whether a recording can be replayed with the given transform, i.e. whether all
+/// images would be resampled in the same way.
+fn recording_matches(ops: &[ImageOp], base: Affine) -> bool {
+    ops.iter().all(|op| match op {
+        ImageOp::Check {
+            chain,
+            image_size,
+            plan,
+        } => ResizePlan::new(&apply_chain(base, chain), image_size.0, image_size.1) == *plan,
+        _ => true,
+    })
+}
+
+impl Renderer<'_> {
+    /// The chain of the current transform, if an image draw is being recorded.
+    fn recorded_chain(&self) -> Option<Vec<Affine>> {
+        self.image_recorder.as_ref().map(|r| r.chain.clone())
+    }
+
+    fn record(&mut self, op: ImageOp) {
+        if let Some(recorder) = &mut self.image_recorder {
+            recorder.ops.push(op);
+        }
+    }
+
+    fn record_set_transform(&mut self, chain: Option<Vec<Affine>>, transform: Affine) {
+        if let Some(recorder) = &mut self.image_recorder {
+            match chain {
+                Some(chain) => {
+                    recorder.check(&chain, transform);
+                    recorder.chain = chain.clone();
+                    recorder.ops.push(ImageOp::SetTransform(chain));
+                }
+                None => recorder.valid = false,
+            }
+        }
+    }
+
+    fn record_draw_pixmap(
+        &mut self,
+        chain: Option<Vec<Affine>>,
+        pixmap: Arc<Pixmap>,
+        quality: ImageQuality,
+        transform: Affine,
+    ) {
+        if let Some(recorder) = &mut self.image_recorder {
+            match chain {
+                Some(chain) => {
+                    recorder.check(&chain, transform);
+                    recorder.ops.push(ImageOp::DrawPixmap {
+                        pixmap,
+                        quality,
+                        chain,
+                    });
+                }
+                None => recorder.valid = false,
+            }
+        }
+    }
+
+    /// Run `f` with the state that stencil images are drawn with: an additional layer for
+    /// the alpha of the color and non-default blend modes, and the non-zero fill rule.
+    fn with_stencil_state(&mut self, alpha: u8, f: impl FnOnce(&mut Self)) {
+        let blend_mode = self.ctx.blend_mode();
+        let push_layer = alpha != 255 || blend_mode != peniko::BlendMode::default();
+
+        if push_layer {
+            self.ctx.push_layer(
+                None,
+                Some(blend_mode),
+                Some(alpha as f32 / 255.0),
+                None,
+                None,
+            );
+        }
+        let old_rule = *self.ctx.fill_rule();
+        self.ctx.set_fill_rule(Fill::NonZero);
+
+        f(self);
+
+        if push_layer {
+            self.ctx.pop_layer();
+        }
+
+        self.ctx.set_fill_rule(old_rule);
+    }
+
+    /// Replay a recorded image draw with the given transform.
+    fn replay(&mut self, ops: &[ImageOp], base: Affine) {
+        for op in ops {
+            match op {
+                ImageOp::Check { .. } => {}
+                ImageOp::SetTransform(chain) => self.ctx.set_transform(apply_chain(base, chain)),
+                ImageOp::PushLayer => self.ctx.push_layer(None, None, None, None, None),
+                ImageOp::PushDestInLayer => self.ctx.push_layer(
+                    None,
+                    Some(peniko::BlendMode::new(Mix::Normal, Compose::DestIn)),
+                    None,
+                    None,
+                    None,
+                ),
+                ImageOp::PopLayer => self.ctx.pop_layer(),
+                ImageOp::DrawPixmap {
+                    pixmap,
+                    quality,
+                    chain,
+                } => self.draw_pixmap(pixmap.clone(), *quality, apply_chain(base, chain)),
+            }
+        }
+    }
+}
+
 impl Renderer<'_> {
     fn draw_image_with_alpha_mask(&mut self, image_data: RenderImageData, alpha_data: LumaData) {
         let img_width = image_data.width();
@@ -97,8 +400,16 @@ impl Renderer<'_> {
             interpolate: alpha_data.interpolate,
         };
 
+        let image_chain = self.recorded_chain();
+        let mask_scale = Affine::scale_non_uniform(
+            img_width as f64 / alpha_data.width as f64,
+            img_height as f64 / alpha_data.height as f64,
+        );
+
         self.ctx.push_layer(None, None, None, None, None);
+        self.record(ImageOp::PushLayer);
         self.ctx.set_transform(image_transform);
+        self.record_set_transform(image_chain.clone(), image_transform);
         self.draw_image(image_data, None);
 
         self.ctx.push_layer(
@@ -108,15 +419,25 @@ impl Renderer<'_> {
             None,
             None,
         );
+        self.record(ImageOp::PushDestInLayer);
         self.ctx.set_transform(mask_transform);
+        self.record_set_transform(
+            image_chain
+                .as_ref()
+                .map(|c| [c.as_slice(), &[mask_scale]].concat()),
+            mask_transform,
+        );
         // Note that there is a circle between `draw_image` and `draw_image_with_alpha_mask`,
         // but `draw_image_with_alpha_mask` is only called if the dimensions or interpolate
         // values between alpha_data and rgb_data don't match. Here we use a
         // `SolidColorImage` so it doesn't affect it.
         self.draw_image(RenderImageData::Solid(mask_image), Some(alpha_data));
         self.ctx.pop_layer();
+        self.record(ImageOp::PopLayer);
         self.ctx.pop_layer();
+        self.record(ImageOp::PopLayer);
         self.ctx.set_transform(image_transform);
+        self.record_set_transform(image_chain, image_transform);
     }
 
     fn resize_image_data(
@@ -193,10 +514,6 @@ impl Renderer<'_> {
         let cur_transform = *self.ctx.transform();
         let mut additional_transform = Affine::IDENTITY;
 
-        let (x_scale, y_scale) = {
-            let (x, y) = x_y_advances(&cur_transform);
-            (x.length() as f32, y.length() as f32)
-        };
         let mut img_width = image_data.width();
         let mut img_height = image_data.height();
         let interpolate = image_data.interpolate() || self.global.force_image_interpolation;
@@ -217,23 +534,22 @@ impl Renderer<'_> {
 
         let has_alpha = alpha_data.is_some();
         let mut may_have_transparency = has_alpha;
-        let needs_resize = x_scale < 1.0 || y_scale < 1.0;
-        let (new_width, new_height) = if needs_resize {
-            let w = (img_width as f32 * x_scale)
-                .ceil()
-                .max(1.0)
-                .min((u16::MAX / 2) as f32) as u32;
-            let h = (img_height as f32 * y_scale)
-                .ceil()
-                .max(1.0)
-                .min((u16::MAX / 2) as f32) as u32;
-            if self.in_type3_glyph {
-                quality = ImageQuality::High;
-            }
-            (w, h)
-        } else {
-            (img_width, img_height)
-        };
+        let plan = ResizePlan::new(&cur_transform, img_width, img_height);
+        let (needs_resize, new_width, new_height) = (plan.needs_resize, plan.width, plan.height);
+        if needs_resize && self.in_type3_glyph {
+            quality = ImageQuality::High;
+        }
+
+        // The rest of this function only depends on the image data and the plan, so a
+        // recording of it can be reused for other transforms with the same plan.
+        let chain = self.recorded_chain();
+        if let Some(chain) = chain {
+            self.record(ImageOp::Check {
+                chain,
+                image_size: (img_width, img_height),
+                plan,
+            });
+        }
 
         // For luma images without alpha, we can resize as single-channel and
         // expand to RGBA afterwards, which is ~4x faster.
@@ -478,11 +794,13 @@ impl Renderer<'_> {
             },
         );
 
-        self.draw_pixmap(
-            Arc::new(pixmap),
-            quality,
-            cur_transform * additional_transform,
-        );
+        let pixmap = Arc::new(pixmap);
+        let transform = cur_transform * additional_transform;
+        let chain = self
+            .recorded_chain()
+            .map(|c| [c.as_slice(), &[additional_transform]].concat());
+        self.record_draw_pixmap(chain, pixmap.clone(), quality, transform);
+        self.draw_pixmap(pixmap, quality, transform);
     }
 
     fn draw_pixmap(&mut self, pixmap: Arc<Pixmap>, quality: ImageQuality, transform: Affine) {
@@ -519,51 +837,75 @@ impl Renderer<'_> {
 
         match image {
             hayro_interpret::Image::Stencil(s) => {
+                // Like for raster images, a previous draw of the same stencil image with the
+                // same color can be replayed. Only the part that doesn't depend on the current
+                // state of the render context is recorded.
+                let key = match s.paint() {
+                    Paint::Color(c) => s.render_cache_key().map(|image| ImageDrawKey {
+                        image,
+                        color: Some({
+                            let [r, g, b, _] = c.to_rgba().to_rgba8();
+                            [r, g, b]
+                        }),
+                        target: (target_width, target_height),
+                        in_type3_glyph: self.in_type3_glyph,
+                        force_interpolation: self.global.force_image_interpolation,
+                    }),
+                    Paint::Pattern(_) => None,
+                };
+                let cached = key.as_ref().and_then(|k| {
+                    self.global
+                        .image_cache
+                        .borrow_mut()
+                        .get(k)
+                        .into_iter()
+                        .find(|ops| recording_matches(ops, transform))
+                });
+
+                if let (Some(ops), Paint::Color(c)) = (cached, s.paint()) {
+                    // The first operation sets the transform, which happens before the
+                    // layer is pushed.
+                    if let Some((ImageOp::SetTransform(chain), rest)) = ops.split_first() {
+                        self.ctx.set_transform(apply_chain(transform, chain));
+                        let alpha = c.to_rgba().to_rgba8()[3];
+                        self.with_stencil_state(alpha, |r| r.replay(rest, transform));
+                    }
+
+                    self.ctx.set_aliasing_threshold(None);
+                    return;
+                }
+
+                self.image_recorder = key.is_some().then(|| ImageRecorder::new(transform));
+
                 s.with_stencil(
                     |stencil, paint| {
-                        transform *= Affine::scale_non_uniform(
+                        let scale = Affine::scale_non_uniform(
                             stencil.scale_factors.0 as f64,
                             stencil.scale_factors.1 as f64,
                         );
+                        transform *= scale;
 
                         match paint {
                             Paint::Color(c) => {
                                 let color = c.to_rgba().to_rgba8();
                                 let alpha = color[3];
 
-                                let blend_mode = self.ctx.blend_mode();
-                                let push_layer =
-                                    alpha != 255 || blend_mode != peniko::BlendMode::default();
                                 self.ctx.set_transform(transform);
-                                if push_layer {
-                                    self.ctx.push_layer(
-                                        None,
-                                        Some(blend_mode),
-                                        Some(alpha as f32 / 255.0),
-                                        None,
-                                        None,
+                                self.record_set_transform(Some(vec![scale]), transform);
+                                self.with_stencil_state(alpha, |r| {
+                                    r.draw_image(
+                                        RenderImageData::Solid(SolidColorImage {
+                                            color: [color[0], color[1], color[2]],
+                                            width: stencil.width,
+                                            height: stencil.height,
+                                            interpolate: stencil.interpolate,
+                                        }),
+                                        Some(stencil),
                                     );
-                                }
-                                let old_rule = *self.ctx.fill_rule();
-                                self.ctx.set_fill_rule(Fill::NonZero);
-
-                                self.draw_image(
-                                    RenderImageData::Solid(SolidColorImage {
-                                        color: [color[0], color[1], color[2]],
-                                        width: stencil.width,
-                                        height: stencil.height,
-                                        interpolate: stencil.interpolate,
-                                    }),
-                                    Some(stencil),
-                                );
-
-                                if push_layer {
-                                    self.ctx.pop_layer();
-                                }
-
-                                self.ctx.set_fill_rule(old_rule);
+                                });
                             }
                             Paint::Pattern(_) => {
+                                self.image_recorder = None;
                                 let (width, height) = (self.ctx.width(), self.ctx.height());
                                 let stencil_rect = Rect::new(
                                     0.0,
@@ -599,7 +941,11 @@ impl Renderer<'_> {
                                     None,
                                     Some(self.ctx.blend_mode()),
                                     None,
-                                    Some(Mask::new_luminance(&mask_pix)),
+                                    Some(Mask::from_parts(
+                                        crate::mask::luminance_mask_data(&mask_pix),
+                                        mask_pix.width(),
+                                        mask_pix.height(),
+                                    )),
                                     None,
                                 );
                                 self.ctx.set_transform(transform);
@@ -619,21 +965,72 @@ impl Renderer<'_> {
                     },
                     Some((target_width, target_height)),
                 );
+
+                if let (Some(key), Some(recorder)) = (key, self.image_recorder.take())
+                    && let Some(ops) = recorder.finish()
+                {
+                    self.global.image_cache.borrow_mut().insert(key, ops);
+                }
             }
             hayro_interpret::Image::Raster(r) => {
-                r.with_rgba(
-                    |image, alpha| {
-                        let (sx, sy) = image.scale_factors();
-                        transform *= Affine::scale_non_uniform(sx as f64, sy as f64);
-                        self.ctx.set_transform(transform);
-                        self.draw_image(image, alpha);
-                    },
-                    Some((target_width, target_height)),
-                );
+                // Drawing an image only depends on the decoded image and the linear part of
+                // the transform, so a previous draw of the same image can be replayed (with
+                // the new transform) instead of decoding and resampling it again.
+                let key = r.render_cache_key().map(|image| ImageDrawKey {
+                    image,
+                    color: None,
+                    target: (target_width, target_height),
+                    in_type3_glyph: self.in_type3_glyph,
+                    force_interpolation: self.global.force_image_interpolation,
+                });
+
+                let cached = key.as_ref().and_then(|k| {
+                    self.global
+                        .image_cache
+                        .borrow_mut()
+                        .get(k)
+                        .into_iter()
+                        .find(|ops| recording_matches(ops, transform))
+                });
+
+                if let Some(ops) = cached {
+                    self.replay(&ops, transform);
+                } else {
+                    self.draw_raster_image(&r, key, transform, (target_width, target_height));
+                }
             }
         }
 
         self.ctx.set_aliasing_threshold(None);
+    }
+
+    /// Draw a raster image, recording the draw if `key` is set.
+    fn draw_raster_image(
+        &mut self,
+        r: &hayro_interpret::RasterImage<'_>,
+        key: Option<ImageDrawKey>,
+        mut transform: Affine,
+        (target_width, target_height): (u32, u32),
+    ) {
+        self.image_recorder = key.is_some().then(|| ImageRecorder::new(transform));
+
+        r.with_rgba(
+            |image, alpha| {
+                let (sx, sy) = image.scale_factors();
+                let scale = Affine::scale_non_uniform(sx as f64, sy as f64);
+                transform *= scale;
+                self.ctx.set_transform(transform);
+                self.record_set_transform(Some(vec![scale]), transform);
+                self.draw_image(image, alpha);
+            },
+            Some((target_width, target_height)),
+        );
+
+        if let (Some(key), Some(recorder)) = (key, self.image_recorder.take())
+            && let Some(ops) = recorder.finish()
+        {
+            self.global.image_cache.borrow_mut().insert(key, ops);
+        }
     }
 }
 

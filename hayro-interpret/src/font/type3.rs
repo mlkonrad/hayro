@@ -20,6 +20,8 @@ use hayro_syntax::page::Resources;
 use kurbo::{Affine, BezPath, Rect};
 use rustc_hash::FxHashMap;
 use skrifa::GlyphId;
+use std::cell::RefCell;
+use std::rc::Rc;
 
 #[derive(Debug)]
 pub(crate) struct Type3<'a> {
@@ -33,6 +35,8 @@ pub(crate) struct Type3<'a> {
     font_bbox: Rect,
     matrix: Affine,
     to_unicode: Option<CMap>,
+    /// The decoded glyph programs, since glyphs are usually drawn many times.
+    decoded_char_procs: RefCell<FxHashMap<String, Option<Rc<[u8]>>>>,
 }
 
 impl<'a> Type3<'a> {
@@ -75,6 +79,7 @@ impl<'a> Type3<'a> {
             matrix,
             dict: dict.clone(),
             to_unicode,
+            decoded_char_procs: RefCell::new(FxHashMap::default()),
         })
     }
 
@@ -121,7 +126,14 @@ impl<'a> Type3<'a> {
 
         let name = self.glyph_simulator.glyph_to_string(glyph.glyph_id)?;
         let program = self.char_procs.get(&name)?;
-        let decoded = program.decoded().ok()?;
+        let decoded = {
+            let mut decoded_char_procs = self.decoded_char_procs.borrow_mut();
+            let entry = decoded_char_procs.entry(name).or_insert_with_key(|name| {
+                let program = self.char_procs.get(name)?;
+                program.decoded().ok().map(|d| Rc::from(d.as_ref()))
+            });
+            entry.clone()?
+        };
         let iter = TypedIter::new(decoded.as_ref());
 
         let is_shape_glyph = {

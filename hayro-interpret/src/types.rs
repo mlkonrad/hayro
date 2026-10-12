@@ -47,6 +47,19 @@ impl<'a, 'b> StencilImage<'a, 'b> {
         }
     }
 
+    /// Return the paint the stencil is drawn with.
+    pub fn paint(&self) -> &Paint<'a> {
+        &self.paint
+    }
+
+    /// Return a key that identifies the result of [`StencilImage::with_stencil`] (for the
+    /// same target dimension), if it doesn't depend on the context the image is drawn in.
+    ///
+    /// Note that the key does not include the paint.
+    pub fn render_cache_key(&self) -> Option<u128> {
+        self.image_xobject.render_cache_key()
+    }
+
     // These are hidden since clients are supposed to call get the
     // width/height from `LumaData` instead.
     #[doc(hidden)]
@@ -85,6 +98,16 @@ impl RasterImage<'_> {
         if let Some(decoded) = self.0.decoded_image(target_dimension) {
             func(decoded.image, decoded.alpha);
         }
+    }
+
+    /// Return a key that identifies the result of [`RasterImage::with_rgba`] (for the same
+    /// target dimension), if it doesn't depend on the context the image is drawn in, for
+    /// example the current transfer function.
+    ///
+    /// Images with the same key decode to the same data, so this can be used to cache work
+    /// derived from the decoded image.
+    pub fn render_cache_key(&self) -> Option<u128> {
+        self.0.render_cache_key()
     }
 
     /// Return the underlying stream object.
