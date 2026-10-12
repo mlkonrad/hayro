@@ -64,7 +64,71 @@ pub struct EncodedSampledShading {
 }
 
 /// The colors of a mesh shading, sampled at integer device pixel positions.
-type Samples = FxHashMap<(u16, u16), ColorComponents>;
+pub(crate) enum Samples {
+    /// A map from pixel positions to colors, for samples that are scattered or very sparse.
+    Sparse(FxHashMap<(u16, u16), ColorComponents>),
+    /// A grid of colors, for samples that densely cover an area.
+    Dense(DenseSamples),
+}
+
+impl Samples {
+    #[inline]
+    fn get(&self, x: u16, y: u16) -> Option<&[f32]> {
+        match self {
+            Self::Sparse(map) => map.get(&(x, y)).map(|c| c.as_slice()),
+            Self::Dense(dense) => dense.get(x, y),
+        }
+    }
+
+    /// An estimate of the memory used by the samples, in bytes.
+    fn size(&self) -> usize {
+        match self {
+            // The key, a `SmallVec<[f32; 4]>` and the overhead of the hash table.
+            Self::Sparse(map) => map.len() * 48,
+            Self::Dense(dense) => dense.colors.len() * 4 + dense.lengths.len(),
+        }
+    }
+}
+
+impl std::fmt::Debug for Samples {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Sparse(map) => write!(f, "Samples::Sparse({} samples)", map.len()),
+            Self::Dense(d) => write!(f, "Samples::Dense({}x{})", d.width, d.height),
+        }
+    }
+}
+
+/// Colors sampled on the pixel grid `[x0, x0 + width) x [y0, y0 + height)`.
+pub(crate) struct DenseSamples {
+    x0: u16,
+    y0: u16,
+    width: usize,
+    height: usize,
+    /// The maximum number of color components of a sample.
+    stride: usize,
+    /// The color components of each pixel, `stride` values per pixel.
+    colors: Vec<f32>,
+    /// The number of color components of each pixel, or 0 if it has no sample.
+    lengths: Vec<u8>,
+}
+
+impl DenseSamples {
+    #[inline]
+    fn get(&self, x: u16, y: u16) -> Option<&[f32]> {
+        let x = usize::from(x.checked_sub(self.x0)?);
+        let y = usize::from(y.checked_sub(self.y0)?);
+
+        if x >= self.width || y >= self.height {
+            return None;
+        }
+
+        let idx = y * self.width + x;
+        let len = usize::from(self.lengths[idx]);
+
+        (len != 0).then(|| &self.colors[idx * self.stride..][..len])
+    }
+}
 
 /// Encoded dummy shading.
 #[derive(Clone, Debug)]
@@ -204,8 +268,8 @@ pub struct SampledShadingCache {
 }
 
 impl SampledShadingCache {
-    /// The maximum total number of cached samples.
-    const BUDGET: usize = 1 << 20;
+    /// The maximum total size of the cached samples, in bytes.
+    const BUDGET: usize = 64 * 1024 * 1024;
 
     fn get_or_insert_with(&mut self, key: u128, compute: impl FnOnce() -> Samples) -> Arc<Samples> {
         self.clock += 1;
@@ -216,7 +280,7 @@ impl SampledShadingCache {
         }
 
         let samples = Arc::new(compute());
-        let size = samples.len();
+        let size = samples.size();
 
         if size <= Self::BUDGET {
             while self.size + size > Self::BUDGET {
@@ -225,7 +289,7 @@ impl SampledShadingCache {
                     break;
                 };
                 let (evicted, _) = self.entries.remove(&oldest).unwrap();
-                self.size -= evicted.len();
+                self.size -= evicted.size();
             }
 
             self.size += size;
@@ -297,7 +361,7 @@ impl ShadingPattern {
             }
             ShadingType::CoonsPatchMesh { patches, function } => {
                 let samples = samples(&|| {
-                    let mut samples = Samples::default();
+                    let mut samples = FxHashMap::default();
                     for patch in patches {
                         sample_patch(
                             &patch.grid(),
@@ -307,7 +371,7 @@ impl ShadingPattern {
                         );
                     }
 
-                    samples
+                    Samples::Sparse(samples)
                 });
 
                 base_transform = Affine::IDENTITY;
@@ -319,7 +383,7 @@ impl ShadingPattern {
             }
             ShadingType::TensorProductPatchMesh { patches, function } => {
                 let samples = samples(&|| {
-                    let mut samples = Samples::default();
+                    let mut samples = FxHashMap::default();
                     for patch in patches {
                         sample_patch(
                             &patch.grid(),
@@ -329,7 +393,7 @@ impl ShadingPattern {
                         );
                     }
 
-                    samples
+                    Samples::Sparse(samples)
                 });
 
                 base_transform = Affine::IDENTITY;
@@ -410,11 +474,13 @@ fn encode_axial_shading(
     )
 }
 
-fn sample_triangles(triangles: &[Triangle], transform: Affine) -> Samples {
-    let mut map = FxHashMap::default();
+/// The maximum number of pixels for which samples are stored densely.
+const MAX_DENSE_SAMPLES: usize = 1 << 24;
 
-    for t in triangles {
-        let t = {
+fn sample_triangles(triangles: &[Triangle], transform: Affine) -> Samples {
+    let triangles: Vec<Triangle> = triangles
+        .iter()
+        .map(|t| {
             let p0 = transform * t.p0.point;
             let p1 = transform * t.p1.point;
             let p2 = transform * t.p2.point;
@@ -427,21 +493,94 @@ fn sample_triangles(triangles: &[Triangle], transform: Affine) -> Samples {
             v2.point = p2;
 
             Triangle::new(v0, v1, v2)
-        };
+        })
+        .collect();
 
+    // The pixel positions each triangle is tested at.
+    let ranges = |t: &Triangle| {
         let bbox = t.bounding_box();
+        (
+            (bbox.x0.floor() as u16)..(bbox.x1.ceil() as u16),
+            (bbox.y0.floor() as u16)..(bbox.y1.ceil() as u16),
+        )
+    };
 
-        for y in (bbox.y0.floor() as u16)..(bbox.y1.ceil() as u16) {
-            for x in (bbox.x0.floor() as u16)..(bbox.x1.ceil() as u16) {
+    let (mut x0, mut y0, mut x1, mut y1) = (u16::MAX, u16::MAX, 0, 0);
+    let mut stride = 0;
+
+    for t in &triangles {
+        let (xs, ys) = ranges(t);
+
+        if !xs.is_empty() && !ys.is_empty() {
+            x0 = x0.min(xs.start);
+            x1 = x1.max(xs.end);
+            y0 = y0.min(ys.start);
+            y1 = y1.max(ys.end);
+            stride = stride.max(t.p0.colors.len());
+        }
+    }
+
+    let width = usize::from(x1.saturating_sub(x0));
+    let height = usize::from(y1.saturating_sub(y0));
+
+    // Each triangle overwrites the samples of previous ones, in both representations.
+    // Samples without color components can't be told apart from missing ones in the dense
+    // representation (this doesn't happen for valid shadings).
+    let min_len = triangles
+        .iter()
+        .map(|t| t.p0.colors.len())
+        .min()
+        .unwrap_or(0);
+
+    if width * height > MAX_DENSE_SAMPLES || stride > usize::from(u8::MAX) || min_len == 0 {
+        let mut map = FxHashMap::default();
+
+        for t in &triangles {
+            let (xs, ys) = ranges(t);
+
+            for y in ys {
+                for x in xs.clone() {
+                    let point = Point::new(x as f64, y as f64);
+                    if t.contains_point(point) {
+                        map.insert((x, y), t.interpolate(point));
+                    }
+                }
+            }
+        }
+
+        return Samples::Sparse(map);
+    }
+
+    let mut colors = vec![0.0; width * height * stride];
+    let mut lengths = vec![0_u8; width * height];
+
+    for t in &triangles {
+        let (xs, ys) = ranges(t);
+
+        for y in ys {
+            let row = usize::from(y - y0) * width;
+
+            for x in xs.clone() {
                 let point = Point::new(x as f64, y as f64);
                 if t.contains_point(point) {
-                    map.insert((x, y), t.interpolate(point));
+                    let color = t.interpolate(point);
+                    let idx = row + usize::from(x - x0);
+                    colors[idx * stride..][..color.len()].copy_from_slice(&color);
+                    lengths[idx] = color.len() as u8;
                 }
             }
         }
     }
 
-    map
+    Samples::Dense(DenseSamples {
+        x0,
+        y0,
+        width,
+        height,
+        stride,
+        colors,
+        lengths,
+    })
 }
 
 /// Sample the triangles that a patch is converted into (see `CoonsPatch::to_triangles` and
@@ -457,7 +596,7 @@ fn sample_patch(
     grid: &PatchGrid,
     interpolate: impl Fn(Point) -> ColorComponents,
     transform: Affine,
-    out: &mut Samples,
+    out: &mut FxHashMap<(u16, u16), ColorComponents>,
 ) {
     // The colors of the grid points, computed when they are first needed.
     let mut colors: Vec<Option<ColorComponents>> = Vec::new();
@@ -766,9 +905,7 @@ impl EncodedShadingType {
                 Some(color_space.to_rgba(&val, 1.0))
             }
             Self::Sampled(EncodedSampledShading { samples, function }) => {
-                let sample_point = (pos.x as u16, pos.y as u16);
-
-                if let Some(color) = samples.get(&sample_point) {
+                if let Some(color) = samples.get(pos.x as u16, pos.y as u16) {
                     if let Some(function) = function {
                         let val = function.eval(&color.to_smallvec())?;
                         Some(color_space.to_rgba(&val, 1.0))

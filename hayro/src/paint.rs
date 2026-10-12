@@ -1,14 +1,85 @@
 use crate::Renderer;
-use hayro_interpret::Paint;
 use hayro_interpret::encode::{EncodedShadingType, texture_dimensions};
 use hayro_interpret::gradient::SvgGradientKind;
 use hayro_interpret::pattern::Pattern;
 use hayro_interpret::util::x_y_advances;
+use hayro_interpret::{CacheKey, Paint};
 use kurbo::{Affine, BezPath, Rect, Shape};
+use rustc_hash::FxHashMap;
 use std::sync::Arc;
 use vello_cpu::color::{AlphaColor, DynamicColor, Srgb};
 use vello_cpu::peniko::{ColorStop, Gradient, ImageQuality, ImageSampler};
 use vello_cpu::{Image, ImageSource, PaintType, PixelMetadata, Pixmap, peniko};
+
+/// Identifies a texture rendered from a pattern.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub(crate) enum TextureKey {
+    Shading {
+        shading: u128,
+        opacity: u32,
+        bbox: [u64; 4],
+    },
+    Tiling {
+        pattern: u128,
+        scale: [u32; 2],
+        size: [u16; 2],
+    },
+}
+
+/// A cache of textures rendered from patterns that is shared across the pages of a
+/// document, evicting the least recently used textures once their total size exceeds a
+/// budget.
+#[derive(Default)]
+pub(crate) struct TextureCache {
+    entries: FxHashMap<TextureKey, (Arc<Pixmap>, Affine, u64)>,
+    size: usize,
+    clock: u64,
+}
+
+impl TextureCache {
+    /// The maximum total size of the cached textures, in bytes.
+    const BUDGET: usize = 64 * 1024 * 1024;
+
+    fn get(&mut self, key: &TextureKey) -> Option<(Arc<Pixmap>, Affine)> {
+        self.clock += 1;
+        let (pixmap, transform, last_used) = self.entries.get_mut(key)?;
+        *last_used = self.clock;
+
+        Some((pixmap.clone(), *transform))
+    }
+
+    fn insert(&mut self, key: TextureKey, (pixmap, transform): (Arc<Pixmap>, Affine)) {
+        let size = pixmap_size(&pixmap);
+
+        if size > Self::BUDGET {
+            return;
+        }
+
+        while self.size + size > Self::BUDGET {
+            let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, (_, _, used))| *used)
+                .map(|(k, _)| k.clone())
+            else {
+                break;
+            };
+            let (evicted, _, _) = self.entries.remove(&oldest).unwrap();
+            self.size -= pixmap_size(&evicted);
+        }
+
+        self.clock += 1;
+        self.size += size;
+
+        if let Some((old, _, _)) = self.entries.insert(key, (pixmap, transform, self.clock)) {
+            self.size -= pixmap_size(&old);
+        }
+    }
+}
+
+fn pixmap_size(pixmap: &Pixmap) -> usize {
+    usize::from(pixmap.width()) * usize::from(pixmap.height()) * 4
+}
 
 impl Renderer<'_> {
     #[must_use]
@@ -91,30 +162,55 @@ impl Renderer<'_> {
 
                             PaintType::Gradient(gradient)
                         } else {
-                            let (width, height) = texture_dimensions(bbox, 1.0);
-                            let mut image = Vec::with_capacity(width as usize * height as usize);
-                            let mut may_have_transparency = false;
-                            let (width, height, transform) =
-                                encoded.sample_texture(bbox, 1.0, |sample| {
-                                    let pixel =
-                                        AlphaColor::<Srgb>::new(sample).premultiply().to_rgba8();
-                                    may_have_transparency |= pixel.a != 255;
-                                    image.push(pixel);
-                                });
+                            // The texture only depends on the encoded shading and the bounding
+                            // box, so it can be reused (for example across pages).
+                            let key = s.transfer_function.is_none().then(|| TextureKey::Shading {
+                                shading: s.cache_key(),
+                                opacity: s.opacity.to_bits(),
+                                bbox: [bbox.x0, bbox.y0, bbox.x1, bbox.y1].map(f64::to_bits),
+                            });
+                            let cached = key
+                                .as_ref()
+                                .and_then(|k| self.global.texture_cache.borrow_mut().get(k));
+
+                            let (pixmap, transform) = cached.unwrap_or_else(|| {
+                                let (width, height) = texture_dimensions(bbox, 1.0);
+                                let mut image =
+                                    Vec::with_capacity(width as usize * height as usize);
+                                let mut may_have_transparency = false;
+                                let (width, height, transform) =
+                                    encoded.sample_texture(bbox, 1.0, |sample| {
+                                        let pixel = AlphaColor::<Srgb>::new(sample)
+                                            .premultiply()
+                                            .to_rgba8();
+                                        may_have_transparency |= pixel.a != 255;
+                                        image.push(pixel);
+                                    });
+
+                                let pixmap = Arc::new(Pixmap::from_parts(
+                                    bytemuck::cast_vec(image),
+                                    width as u16,
+                                    height as u16,
+                                    PixelMetadata {
+                                        may_have_transparency,
+                                        ..Default::default()
+                                    },
+                                ));
+
+                                if let Some(key) = key {
+                                    self.global
+                                        .texture_cache
+                                        .borrow_mut()
+                                        .insert(key, (pixmap.clone(), transform));
+                                }
+
+                                (pixmap, transform)
+                            });
+
                             paint_transform = path_transform.inverse() * transform;
 
-                            let pixmap = Pixmap::from_parts(
-                                bytemuck::cast_vec(image),
-                                width as u16,
-                                height as u16,
-                                PixelMetadata {
-                                    may_have_transparency,
-                                    ..Default::default()
-                                },
-                            );
-
                             let image = Image {
-                                image: ImageSource::Pixmap(Arc::new(pixmap)),
+                                image: ImageSource::Pixmap(pixmap),
                                 sampler: ImageSampler {
                                     x_extend: peniko::Extend::Repeat,
                                     y_extend: peniko::Extend::Repeat,
@@ -153,16 +249,41 @@ impl Renderer<'_> {
                         let pix_width = x_step.abs().round() as u16;
                         let pix_height = y_step.abs().round() as u16;
 
-                        let mut ctx = self.child_context(pix_width, pix_height);
-                        let mut renderer = Renderer::new(&mut ctx, self.global);
-                        renderer.inside_pattern = true;
                         let mut initial_transform = Affine::scale_non_uniform(xs as f64, ys as f64)
                             * Affine::translate((-bbox.x0, -bbox.y0));
-                        t.interpret(&mut renderer, initial_transform, is_stroke);
-                        let mut pix = Pixmap::new(pix_width, pix_height);
-                        renderer.ctx.flush();
-                        let mut resources = vello_cpu::Resources::default();
-                        renderer.ctx.render(&mut pix, &mut resources);
+
+                        // The rendered pattern only depends on the pattern, the scale and the
+                        // size, so it can be reused (for example across pages).
+                        let key = t.render_cache_key().map(|pattern| TextureKey::Tiling {
+                            pattern,
+                            scale: [xs.to_bits(), ys.to_bits()],
+                            size: [pix_width, pix_height],
+                        });
+                        let cached = key
+                            .as_ref()
+                            .and_then(|k| self.global.texture_cache.borrow_mut().get(k))
+                            .map(|(pix, _)| pix);
+
+                        let pix = cached.unwrap_or_else(|| {
+                            let mut ctx = self.child_context(pix_width, pix_height);
+                            let mut renderer = Renderer::new(&mut ctx, self.global);
+                            renderer.inside_pattern = true;
+                            t.interpret(&mut renderer, initial_transform, is_stroke);
+                            let mut pix = Pixmap::new(pix_width, pix_height);
+                            renderer.ctx.flush();
+                            let mut resources = vello_cpu::Resources::default();
+                            renderer.ctx.render(&mut pix, &mut resources);
+                            let pix = Arc::new(pix);
+
+                            if let Some(key) = key {
+                                self.global
+                                    .texture_cache
+                                    .borrow_mut()
+                                    .insert(key, (pix.clone(), Affine::IDENTITY));
+                            }
+
+                            pix
+                        });
 
                         // TODO: Fix these
                         if x_step < 0.0 {
@@ -179,7 +300,7 @@ impl Renderer<'_> {
                             path_transform.inverse() * t.matrix * initial_transform.inverse();
 
                         let image = Image {
-                            image: ImageSource::Pixmap(Arc::new(pix)),
+                            image: ImageSource::Pixmap(pix),
                             sampler: ImageSampler {
                                 x_extend: peniko::Extend::Repeat,
                                 y_extend: peniko::Extend::Repeat,

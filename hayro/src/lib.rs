@@ -74,6 +74,7 @@ pub(crate) struct GlobalState {
     outline_cache: Rc<RefCell<FxHashMap<u128, Rc<BezPath>>>>,
     soft_mask_cache: Rc<RefCell<mask::SoftMaskCache>>,
     shading_cache: Rc<RefCell<SampledShadingCache>>,
+    texture_cache: Rc<RefCell<paint::TextureCache>>,
     /// A pixmap that can be reused for rendering soft masks.
     mask_pixmap: Cell<Option<Pixmap>>,
     scaler: Scaler,
@@ -87,6 +88,7 @@ impl GlobalState {
             outline_cache: cache.outline_cache.clone(),
             soft_mask_cache: cache.soft_mask_cache.clone(),
             shading_cache: cache.shading_cache.clone(),
+            texture_cache: cache.texture_cache.clone(),
             mask_pixmap: Cell::new(None),
             scaler: Scaler::new(image::RESAMPLING_FUNCTION),
             force_image_interpolation: settings.force_image_interpolation,
@@ -196,6 +198,7 @@ pub struct RenderCache<'a> {
     pub(crate) outline_cache: Rc<RefCell<FxHashMap<u128, Rc<BezPath>>>>,
     pub(crate) soft_mask_cache: Rc<RefCell<mask::SoftMaskCache>>,
     pub(crate) shading_cache: Rc<RefCell<SampledShadingCache>>,
+    pub(crate) texture_cache: Rc<RefCell<paint::TextureCache>>,
 }
 
 impl<'a> RenderCache<'a> {
@@ -206,6 +209,7 @@ impl<'a> RenderCache<'a> {
             outline_cache: Rc::new(RefCell::new(FxHashMap::default())),
             soft_mask_cache: Rc::new(RefCell::new(mask::SoftMaskCache::default())),
             shading_cache: Rc::new(RefCell::new(SampledShadingCache::default())),
+            texture_cache: Rc::new(RefCell::new(paint::TextureCache::default())),
         }
     }
 }

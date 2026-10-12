@@ -214,6 +214,35 @@ impl<'a> TilingPattern<'a> {
         })
     }
 
+    /// Return a key that identifies how this pattern renders, if it doesn't depend on the
+    /// context it is used in.
+    ///
+    /// Two patterns with the same key produce the same output when interpreted with the same
+    /// initial transform. This is only the case for colored patterns, since uncolored ones
+    /// are painted with the current color.
+    pub fn render_cache_key(&self) -> Option<u128> {
+        if !self.is_color {
+            return None;
+        }
+
+        // The cache key of the stream only covers its dictionary, not its content.
+        let data = self.stream.raw_data();
+        let bbox = [
+            self.ctx_bbox.x0,
+            self.ctx_bbox.y0,
+            self.ctx_bbox.x1,
+            self.ctx_bbox.y1,
+        ]
+        .map(f64::to_bits);
+
+        Some(hash128(&(
+            self.cache_key,
+            data.as_ref(),
+            bbox,
+            self.nesting_depth,
+        )))
+    }
+
     /// Interpret the contents of the pattern into the given device.
     pub fn interpret(
         &self,
