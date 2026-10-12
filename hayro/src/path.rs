@@ -2,6 +2,10 @@ use crate::{Renderer, convert_fill_rule};
 use hayro_interpret::{DrawMode, DrawProps, FillRule, StrokeProps};
 use kurbo::{Affine, BezPath, Point, Rect, Shape};
 
+/// The minimum length of one period of a dash pattern in device pixels, below which paths are
+/// stroked without dashes.
+const MIN_DASH_PERIOD: f32 = 0.5;
+
 impl Renderer<'_> {
     pub(super) fn set_stroke_properties(&mut self, stroke_props: &StrokeProps, is_text: bool) {
         let threshold = if is_text { 0.25 } else { 1.0 };
@@ -19,13 +23,24 @@ impl Renderer<'_> {
             line_width *= threshold;
         }
 
+        // A dash pattern that repeats more than twice per device pixel cannot be resolved,
+        // but would split the path into an enormous number of segments (millions for a
+        // single line with a pattern like `[0.000015 0.000015] 0 d`). Like MuPDF, stroke such
+        // paths without dashes instead.
+        let dash_period: f32 = stroke_props.dash_array.iter().sum();
+        let dash_pattern = if dash_period * min_factor < MIN_DASH_PERIOD {
+            kurbo::Dashes::new()
+        } else {
+            stroke_props.dash_array.iter().map(|n| *n as f64).collect()
+        };
+
         let stroke = kurbo::Stroke {
             width: line_width as f64,
             join: stroke_props.line_join,
             miter_limit: stroke_props.miter_limit as f64,
             start_cap: stroke_props.line_cap,
             end_cap: stroke_props.line_cap,
-            dash_pattern: stroke_props.dash_array.iter().map(|n| *n as f64).collect(),
+            dash_pattern,
             dash_offset: stroke_props.dash_offset as f64,
         };
 
